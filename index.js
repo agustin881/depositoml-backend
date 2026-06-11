@@ -24,9 +24,21 @@ const supabase = createClient(
 const ML_CLIENT_ID     = process.env.ML_CLIENT_ID;
 const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET;
 const ML_USER_ID       = process.env.ML_USER_ID || '67619515';
-const DIAS_BUSQUEDA    = parseInt(process.env.DIAS_BUSQUEDA || '5', 10);
+const DIAS_BUSQUEDA    = parseInt(process.env.DIAS_BUSQUEDA || '8', 10);
 
 const LOGISTIC = { flex: 'self_service', colecta: 'cross_docking' };
+
+// Solo trabajamos los envíos que salen de NUESTRO depósito (Rosario).
+// Se compara contra la dirección del depósito de origen del envío,
+// sin importar mayúsculas ni acentos. Configurable en Railway con
+// DEPOSITO_FILTRO (texto a buscar en la dirección, o el ID del depósito).
+// Dejar la variable vacía ("") desactiva el filtro.
+function normalizar(t) {
+  return String(t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+const DEPOSITO_FILTRO = normalizar(
+  process.env.DEPOSITO_FILTRO !== undefined ? process.env.DEPOSITO_FILTRO : 'soriano'
+);
 
 // Estados de envío de ML traducidos
 const ESTADO_ES = {
@@ -167,9 +179,24 @@ async function obtenerShipmentsDetallados(token) {
       s.logistic = ship.logistic_type || (ship.logistic && ship.logistic.type) || '';
       s.limite   = (ship.shipping_option && ship.shipping_option.estimated_handling_limit
                     && ship.shipping_option.estimated_handling_limit.date) || null;
-    } catch (e) { s.status = 'error'; s.logistic = ''; s.limite = null; }
+      const sa = ship.sender_address || {};
+      s.dep_id  = sa.id ? String(sa.id) : '';
+      s.dep_dir = `${sa.address_line || ''} ${(sa.city && sa.city.name) || ''}`.trim();
+    } catch (e) { s.status = 'error'; s.logistic = ''; s.limite = null; s.dep_id = ''; s.dep_dir = ''; }
     return s;
   });
+
+  // Filtro por depósito de origen (tenemos más de un depósito en ML;
+  // esta app maneja solo el de Rosario). Si el envío no informa
+  // depósito, lo dejamos pasar para no perder nada.
+  if (DEPOSITO_FILTRO) {
+    const antes = detallados.length;
+    const filtrados = detallados.filter(s =>
+      !s.dep_dir ? true : normalizar(s.dep_dir).includes(DEPOSITO_FILTRO) || s.dep_id === DEPOSITO_FILTRO);
+    const afuera = antes - filtrados.length;
+    if (afuera) console.log(`[ENVIOS] ${afuera} envío(s) de otro depósito quedaron afuera del listado`);
+    return filtrados;
+  }
   return detallados;
 }
 
@@ -179,6 +206,43 @@ const ordenarPorSku = (a, b) => {
   return (a.sku || '').localeCompare(b.sku || '', 'es', { numeric: true, sensitivity: 'base' });
 };
 
+// ── Caché compartida de envíos + precarga automática ──────────────
+// La misma búsqueda sirve para Flex, Colecta y Seguimiento. Además,
+// en horario laboral el backend la refresca solo cada PRECARGA_MINUTOS,
+// así el "Buscar pendientes" responde al instante.
+const CACHE_TTL_MS   = parseInt(process.env.CACHE_MINUTOS || '5', 10) * 60 * 1000;
+const PRECARGA_DESDE = process.env.PRECARGA_DESDE || '06:30';   // hora argentina
+const PRECARGA_HASTA = process.env.PRECARGA_HASTA || '19:00';
+const PRECARGA_MIN   = parseInt(process.env.PRECARGA_MINUTOS || '5', 10);
+
+let _envCache = { at: 0, detallados: null };
+
+async function obtenerDetalladosConCache(token, forzar = false) {
+  if (!forzar && _envCache.detallados && Date.now() - _envCache.at < CACHE_TTL_MS) {
+    return _envCache.detallados;
+  }
+  const detallados = await obtenerShipmentsDetallados(token);
+  _envCache = { at: Date.now(), detallados };
+  return detallados;
+}
+
+let _precargando = false;
+setInterval(async () => {
+  if (_precargando) return;
+  try {
+    const hhmm = new Date(Date.now() - 3*3600*1000).toISOString().substring(11,16);
+    if (hhmm < PRECARGA_DESDE || hhmm > PRECARGA_HASTA) return;
+    if (_envCache.detallados && Date.now() - _envCache.at < PRECARGA_MIN * 60 * 1000 - 30000) return;
+    _precargando = true;
+    const token = await getValidToken(ML_USER_ID);
+    if (token) {
+      await obtenerDetalladosConCache(token, true);
+      console.log(`[PRECARGA] envíos actualizados (${_envCache.detallados.length})`);
+    }
+  } catch (e) { console.error('[PRECARGA]', e.message); }
+  finally { _precargando = false; }
+}, 60 * 1000);
+
 // ── Envíos de una tanda (flex/colecta), ordenados por SKU ─────────
 async function obtenerEnvios(tipo) {
   const logisticBuscado = LOGISTIC[tipo];
@@ -186,7 +250,7 @@ async function obtenerEnvios(tipo) {
   const token = await getValidToken(ML_USER_ID);
   if (!token) throw new Error('No hay token de ML disponible en ml_tokens');
 
-  const detallados = await obtenerShipmentsDetallados(token);
+  const detallados = await obtenerDetalladosConCache(token);
   const deLaTanda = detallados.filter(s => s.logistic === logisticBuscado);
 
   // ¿El despacho está programado para más adelante? (cliente eligió recibir después)
@@ -733,7 +797,7 @@ app.get('/api/despacho/seguimiento', async (_req, res) => {
   try {
     const token = await getValidToken(ML_USER_ID);
     if (!token) throw new Error('No hay token de ML disponible');
-    const detallados = await obtenerShipmentsDetallados(token);
+    const detallados = await obtenerDetalladosConCache(token);
     const ids = detallados.map(s => s.shipment_id);
 
     let impSet = new Set(), desMap = new Map();
@@ -781,7 +845,7 @@ app.get('/api/despacho/seguimiento', async (_req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '3.0.1' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '3.2' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

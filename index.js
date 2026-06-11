@@ -29,6 +29,19 @@ const LOGISTIC = { flex: 'self_service', colecta: 'cross_docking' };
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// ── Middleware: exige usuario logueado (token de Supabase) ────────
+async function requireAuth(req, res, next) {
+  try {
+    const h = req.headers.authorization || '';
+    const token = h.startsWith('Bearer ') ? h.slice(7) : '';
+    if (!token) return res.status(401).json({ error: 'No autorizado' });
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data || !data.user) return res.status(401).json({ error: 'Sesión inválida' });
+    req.authUser = data.user;
+    next();
+  } catch (e) { return res.status(401).json({ error: 'No autorizado' }); }
+}
+
 // Hora Argentina (UTC-3)
 function fechaHoyART()      { return new Date(Date.now() - 3*3600*1000).toISOString().substring(0,10); }
 function inicioDeHoyART()   { return fechaHoyART() + 'T00:00:00.000-03:00'; }
@@ -192,6 +205,9 @@ function pdfResponse(res, bytes, ok, fallidas, nombre) {
   res.setHeader('X-Etiquetas-Fallidas', String(fallidas));
   res.send(Buffer.from(bytes));
 }
+
+// ── Todos los endpoints del depósito exigen estar logueado ────────
+app.use('/api/despacho', requireAuth);
 
 // ── Endpoints: impresión ──────────────────────────────────────────
 app.get('/api/despacho/pendientes', async (req, res) => {

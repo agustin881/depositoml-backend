@@ -27,6 +27,20 @@ const DIAS_BUSQUEDA    = parseInt(process.env.DIAS_BUSQUEDA || '5', 10);
 
 const LOGISTIC = { flex: 'self_service', colecta: 'cross_docking' };
 
+// Estados de envío de ML traducidos
+const ESTADO_ES = {
+  pending:        'Pendiente',
+  handling:       'En preparación',
+  ready_to_print: 'Etiqueta por imprimir',
+  printed:        'Etiqueta impresa',
+  ready_to_ship:  'Listo para despachar (todavía no salió)',
+  shipped:        'Despachado · en camino',
+  delivered:      'Entregado',
+  not_delivered:  'No entregado · con problema',
+  cancelled:      'Cancelado',
+  returned:       'Devuelto'
+};
+
 // Emails autorizados a entrar al depósito (separados por coma en Railway).
 // Si la variable está vacía, deja entrar a cualquier usuario logueado.
 const EMAILS_DEPOSITO = (process.env.EMAILS_DEPOSITO || '')
@@ -159,7 +173,10 @@ async function obtenerEnvios(tipo) {
 
   const deLaTanda = detallados.filter(s => s.logistic === logisticBuscado);
   const listos    = deLaTanda.filter(s => s.status === 'ready_to_ship');
-  const noListos  = deLaTanda.filter(s => s.status !== 'ready_to_ship');
+  // "No listos" = solo lo que todavía está en proceso, NO lo ya despachado/entregado/cancelado
+  const TERMINADOS = ['shipped', 'delivered', 'not_delivered', 'cancelled', 'returned'];
+  const noListos  = deLaTanda.filter(s =>
+    s.status !== 'ready_to_ship' && !TERMINADOS.includes(s.status));
 
   const ordenarPorSku = (a, b) => {
     if (!a.sku && b.sku) return 1;
@@ -376,8 +393,64 @@ app.get('/api/despacho/colectas', async (_req, res) => {
   } catch (e) { console.error('[COLECTAS]', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// ── Endpoint: buscar una venta por número (estado en ML + lo nuestro) ──
+app.get('/api/despacho/buscar', async (req, res) => {
+  try {
+    const venta = (req.query.venta || '').trim().replace(/\s+/g, '');
+    if (!venta) return res.status(400).json({ error: 'Indicá el número de venta' });
+    const token = await getValidToken(ML_USER_ID);
+    if (!token) throw new Error('No hay token de ML disponible');
+
+    const ro = await fetch(`https://api.mercadolibre.com/orders/${venta}?access_token=${token}`);
+    const order = await ro.json();
+    if (order.error || !order.id) {
+      return res.status(404).json({ error: 'No encontré esa venta. Revisá el número.' });
+    }
+
+    const item = (order.order_items && order.order_items[0]) || {};
+    const sku = (item.item && (item.item.seller_sku || item.item.seller_custom_field)) || '';
+    const titulo = (item.item && item.item.title) || '';
+    const comprador = (order.buyer &&
+      (order.buyer.nickname || `${order.buyer.first_name || ''} ${order.buyer.last_name || ''}`.trim())) || '';
+    const shipId = order.shipping && order.shipping.id;
+
+    let estadoCodigo = '', substatus = '', estado = 'Sin envío asociado';
+    if (shipId) {
+      const rs = await fetch(`https://api.mercadolibre.com/shipments/${shipId}`,
+        { headers: { Authorization: `Bearer ${token}` } });
+      const ship = await rs.json();
+      estadoCodigo = ship.status || '';
+      substatus = ship.substatus || '';
+      estado = ESTADO_ES[estadoCodigo] || estadoCodigo || 'Sin información';
+    }
+
+    // ¿Se imprimió desde el sistema?
+    let impreso = false, impreso_at = null;
+    if (shipId) {
+      const { data } = await supabase.from('dep_impresiones')
+        .select('impreso_at').eq('shipment_id', String(shipId))
+        .order('impreso_at', { ascending: true }).limit(1);
+      if (data && data[0]) { impreso = true; impreso_at = data[0].impreso_at; }
+    }
+
+    res.json({
+      nro_venta: String(order.id),
+      shipment_id: shipId ? String(shipId) : null,
+      sku, titulo, comprador,
+      fecha: order.date_created || null,
+      estado, estado_codigo: estadoCodigo, substatus,
+      despachado: ['shipped', 'delivered'].includes(estadoCodigo),
+      entregado: estadoCodigo === 'delivered',
+      impreso, impreso_at
+    });
+  } catch (e) {
+    console.error('[BUSCAR]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '2.1' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '2.2' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

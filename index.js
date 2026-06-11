@@ -137,7 +137,7 @@ async function obtenerShipmentsDetallados(token) {
     total = (data.paging && data.paging.total) || 0;
     for (const o of (data.results || [])) ordenes.push(o);
     offset += 50;
-    await sleep(250);
+    await sleep(150);
   }
 
   const porShipment = new Map();
@@ -156,7 +156,7 @@ async function obtenerShipmentsDetallados(token) {
   }
 
   const shipments = Array.from(porShipment.values());
-  const detallados = await poolMap(shipments, 5, async (s) => {
+  const detallados = await poolMap(shipments, 12, async (s) => {
     try {
       const r = await fetch(`https://api.mercadolibre.com/shipments/${s.shipment_id}`, {
         headers: { Authorization: `Bearer ${token}` }
@@ -781,7 +781,7 @@ app.get('/api/despacho/seguimiento', async (_req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '3.0' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '3.0.1' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

@@ -172,6 +172,8 @@ async function obtenerEnvios(tipo) {
 }
 
 // ── Helper: pedir etiquetas y armar el PDF en orden ───────────────
+// Junta TODAS las etiquetas primero (en orden por SKU) y manda las
+// hojas de detalle/remito al final del archivo.
 async function armarPdf(shipments, token) {
   const buffers = await poolMap(shipments, 5, async (s) => {
     const r = await fetch(
@@ -181,18 +183,38 @@ async function armarPdf(shipments, token) {
     if (!r.ok) { console.error(`[ETIQUETA] ship=${s.shipment_id} HTTP ${r.status}`); return null; }
     return await r.buffer();
   });
-  const merged = await PDFDocument.create();
+
+  const etiquetas = await PDFDocument.create();
+  const detalles  = await PDFDocument.create();
   const impresos = []; let fallidas = 0;
+
   for (let i = 0; i < buffers.length; i++) {
     const buf = buffers[i];
     if (!buf || buf.__error) { fallidas++; continue; }
     try {
       const src = await PDFDocument.load(buf);
-      const pages = await merged.copyPages(src, src.getPageIndices());
-      pages.forEach(p => merged.addPage(p));
+      const idx = src.getPageIndices();
+      // Página 0 = etiqueta; el resto (1+) = hoja de detalle / remito
+      const [lab] = await etiquetas.copyPages(src, [idx[0]]);
+      etiquetas.addPage(lab);
+      if (idx.length > 1) {
+        const dets = await detalles.copyPages(src, idx.slice(1));
+        dets.forEach(p => detalles.addPage(p));
+      }
       impresos.push(shipments[i]);
-    } catch (e) { console.error(`[ETIQUETA] unir ship=${shipments[i].shipment_id}: ${e.message}`); fallidas++; }
+    } catch (e) {
+      console.error(`[ETIQUETA] unir ship=${shipments[i].shipment_id}: ${e.message}`);
+      fallidas++;
+    }
   }
+
+  // Combinar: primero todas las etiquetas (orden SKU), después los detalles
+  const merged = await PDFDocument.create();
+  const labPages = await merged.copyPages(etiquetas, etiquetas.getPageIndices());
+  labPages.forEach(p => merged.addPage(p));
+  const detPages = await merged.copyPages(detalles, detalles.getPageIndices());
+  detPages.forEach(p => merged.addPage(p));
+
   const bytes = await merged.save();
   return { bytes, impresos, fallidas };
 }
@@ -355,7 +377,7 @@ app.get('/api/despacho/colectas', async (_req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '2.0' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '2.1' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

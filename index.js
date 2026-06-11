@@ -1,6 +1,7 @@
 // ============================================================
-//  DEPÓSITO · BACKEND  v2
+//  DEPÓSITO · BACKEND  v3
 //  Fase 1: impresión por SKU + registro + reimpresión + conteo
+//  Fase 2 (parcial): código de autorización del día + colectas del día
 //  App separada de MargenML. Comparte la base Supabase
 //  (token de ML en ml_tokens) y usa tablas propias dep_*.
 // ============================================================
@@ -28,9 +29,12 @@ const LOGISTIC = { flex: 'self_service', colecta: 'cross_docking' };
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// Inicio del día de HOY en hora Argentina (UTC-3), en ISO
-function inicioDeHoyART() {
-  return new Date().toISOString().substring(0, 10) + 'T00:00:00.000-03:00';
+// Hora Argentina (UTC-3)
+function fechaHoyART()      { return new Date(Date.now() - 3*3600*1000).toISOString().substring(0,10); }
+function inicioDeHoyART()   { return fechaHoyART() + 'T00:00:00.000-03:00'; }
+function diaSemanaHoyART()  {
+  const d = new Date(Date.now() - 3*3600*1000);
+  return ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'][d.getUTCDay()];
 }
 
 // ── Helper: token válido (mismo patrón que MargenML) ──────────────
@@ -38,32 +42,24 @@ async function getValidToken(userId) {
   const { data: tokenRow } = await supabase
     .from('ml_tokens').select('*').eq('user_id', String(userId)).single();
   if (!tokenRow) return null;
-
-  if (new Date(tokenRow.expires_at).getTime() - 60000 > Date.now()) {
-    return tokenRow.access_token;
-  }
+  if (new Date(tokenRow.expires_at).getTime() - 60000 > Date.now()) return tokenRow.access_token;
 
   const resp = await fetch('https://api.mercadolibre.com/oauth/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
-      grant_type:    'refresh_token',
-      client_id:     ML_CLIENT_ID,
-      client_secret: ML_CLIENT_SECRET,
-      refresh_token: tokenRow.refresh_token
+      grant_type: 'refresh_token', client_id: ML_CLIENT_ID,
+      client_secret: ML_CLIENT_SECRET, refresh_token: tokenRow.refresh_token
     })
   });
   const data = await resp.json();
   if (data.error) { console.error('[TOKEN] refresh falló:', data); return tokenRow.access_token; }
 
   await supabase.from('ml_tokens').upsert({
-    user_id:       String(userId),
-    access_token:  data.access_token,
-    refresh_token: data.refresh_token,
-    expires_at:    new Date(Date.now() + data.expires_in * 1000).toISOString(),
-    updated_at:    new Date().toISOString()
+    user_id: String(userId), access_token: data.access_token, refresh_token: data.refresh_token,
+    expires_at: new Date(Date.now() + data.expires_in * 1000).toISOString(),
+    updated_at: new Date().toISOString()
   }, { onConflict: 'user_id' });
-
   return data.access_token;
 }
 
@@ -86,14 +82,13 @@ async function poolMap(items, limit, fn) {
 async function obtenerEnvios(tipo) {
   const logisticBuscado = LOGISTIC[tipo];
   if (!logisticBuscado) throw new Error('Tipo inválido (usá flex o colecta)');
-
   const token = await getValidToken(ML_USER_ID);
   if (!token) throw new Error('No hay token de ML disponible en ml_tokens');
 
   const desde = new Date();
   desde.setDate(desde.getDate() - DIAS_BUSQUEDA);
-  const desdeISO = desde.toISOString().substring(0, 10) + 'T00:00:00.000-03:00';
-  const hastaISO = new Date().toISOString().substring(0, 10) + 'T23:59:59.000-03:00';
+  const desdeISO = desde.toISOString().substring(0,10) + 'T00:00:00.000-03:00';
+  const hastaISO = new Date().toISOString().substring(0,10) + 'T23:59:59.000-03:00';
 
   const ordenes = [];
   let offset = 0, total = 999;
@@ -121,11 +116,8 @@ async function obtenerEnvios(tipo) {
     const titulo = (item.item && item.item.title) || '';
     if (!porShipment.has(shipId)) {
       porShipment.set(shipId, {
-        shipment_id: String(shipId),
-        nro_venta:   String(o.id),
-        sku:         sku ? String(sku).trim() : '',
-        titulo,
-        unidades:    item.quantity || 1
+        shipment_id: String(shipId), nro_venta: String(o.id),
+        sku: sku ? String(sku).trim() : '', titulo, unidades: item.quantity || 1
       });
     }
   }
@@ -152,15 +144,12 @@ async function obtenerEnvios(tipo) {
     if (a.sku && !b.sku) return -1;
     return a.sku.localeCompare(b.sku, 'es', { numeric: true, sensitivity: 'base' });
   };
-  listos.sort(ordenarPorSku);
-  noListos.sort(ordenarPorSku);
-
+  listos.sort(ordenarPorSku); noListos.sort(ordenarPorSku);
   console.log(`[ENVIOS] tipo=${tipo} listos=${listos.length} no_listos=${noListos.length}`);
   return { listos, no_listos: noListos, token };
 }
 
 // ── Helper: pedir etiquetas y armar el PDF en orden ───────────────
-// `shipments` debe venir ya ordenado (cada uno con .shipment_id).
 async function armarPdf(shipments, token) {
   const buffers = await poolMap(shipments, 5, async (s) => {
     const r = await fetch(
@@ -170,10 +159,8 @@ async function armarPdf(shipments, token) {
     if (!r.ok) { console.error(`[ETIQUETA] ship=${s.shipment_id} HTTP ${r.status}`); return null; }
     return await r.buffer();
   });
-
   const merged = await PDFDocument.create();
-  const impresos = [];
-  let fallidas = 0;
+  const impresos = []; let fallidas = 0;
   for (let i = 0; i < buffers.length; i++) {
     const buf = buffers[i];
     if (!buf || buf.__error) { fallidas++; continue; }
@@ -182,24 +169,17 @@ async function armarPdf(shipments, token) {
       const pages = await merged.copyPages(src, src.getPageIndices());
       pages.forEach(p => merged.addPage(p));
       impresos.push(shipments[i]);
-    } catch (e) {
-      console.error(`[ETIQUETA] no se pudo unir ship=${shipments[i].shipment_id}: ${e.message}`);
-      fallidas++;
-    }
+    } catch (e) { console.error(`[ETIQUETA] unir ship=${shipments[i].shipment_id}: ${e.message}`); fallidas++; }
   }
   const bytes = await merged.save();
   return { bytes, impresos, fallidas };
 }
 
-// ── Helper: registrar impresiones en dep_impresiones ──────────────
 async function registrarImpresion(impresos, tipo) {
   if (!impresos.length) return;
   const filas = impresos.map(s => ({
-    shipment_id: s.shipment_id,
-    tipo,
-    sku:        s.sku || null,
-    nro_venta:  s.nro_venta || null,
-    titulo:     s.titulo || null
+    shipment_id: s.shipment_id, tipo, sku: s.sku || null,
+    nro_venta: s.nro_venta || null, titulo: s.titulo || null
   }));
   const { error } = await supabase.from('dep_impresiones').insert(filas);
   if (error) console.error('[REGISTRO] error guardando impresión:', error.message);
@@ -213,45 +193,33 @@ function pdfResponse(res, bytes, ok, fallidas, nombre) {
   res.send(Buffer.from(bytes));
 }
 
-// ── Endpoint: pendientes (vista previa) ───────────────────────────
+// ── Endpoints: impresión ──────────────────────────────────────────
 app.get('/api/despacho/pendientes', async (req, res) => {
   try {
     const tipo = (req.query.tipo || '').toLowerCase();
     const { listos, no_listos } = await obtenerEnvios(tipo);
     res.json({
-      tipo,
-      cantidad: listos.length,
-      listos:    listos.map(({ shipment_id, nro_venta, sku, titulo, unidades }) =>
+      tipo, cantidad: listos.length,
+      listos: listos.map(({ shipment_id, nro_venta, sku, titulo, unidades }) =>
         ({ shipment_id, nro_venta, sku, titulo, unidades })),
       no_listos: no_listos.map(({ shipment_id, nro_venta, sku, titulo, status }) =>
         ({ shipment_id, nro_venta, sku, titulo, status }))
     });
-  } catch (e) {
-    console.error('[PENDIENTES] error:', e.message);
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { console.error('[PENDIENTES]', e.message); res.status(500).json({ error: e.message }); }
 });
 
-// ── Endpoint: etiquetas (PDF por SKU + registra impresión) ────────
 app.get('/api/despacho/etiquetas', async (req, res) => {
   try {
     const tipo = (req.query.tipo || '').toLowerCase();
     const { listos, token } = await obtenerEnvios(tipo);
-    if (listos.length === 0) {
-      return res.status(404).json({ error: 'No hay envíos listos para imprimir en esta tanda' });
-    }
+    if (!listos.length) return res.status(404).json({ error: 'No hay envíos listos para imprimir en esta tanda' });
     const { bytes, impresos, fallidas } = await armarPdf(listos, token);
     await registrarImpresion(impresos, tipo);
     console.log(`[ETIQUETAS] tipo=${tipo} unidas=${impresos.length} fallidas=${fallidas}`);
-    const fecha = new Date().toISOString().substring(0, 10);
-    pdfResponse(res, bytes, impresos.length, fallidas, `etiquetas_${tipo}_${fecha}.pdf`);
-  } catch (e) {
-    console.error('[ETIQUETAS] error:', e.message);
-    res.status(500).json({ error: e.message });
-  }
+    pdfResponse(res, bytes, impresos.length, fallidas, `etiquetas_${tipo}_${fechaHoyART()}.pdf`);
+  } catch (e) { console.error('[ETIQUETAS]', e.message); res.status(500).json({ error: e.message }); }
 });
 
-// ── Endpoint: impresas hoy (para el contador y la reimpresión) ────
 app.get('/api/despacho/impresas', async (req, res) => {
   try {
     const tipo = (req.query.tipo || '').toLowerCase();
@@ -262,76 +230,107 @@ app.get('/api/despacho/impresas', async (req, res) => {
     if (tipo === 'flex' || tipo === 'colecta') q = q.eq('tipo', tipo);
     const { data, error } = await q;
     if (error) throw new Error(error.message);
-
-    // Quedarnos con un registro por envío (la impresión más reciente)
     const porShip = new Map();
-    for (const row of (data || [])) {
-      if (!porShip.has(row.shipment_id)) porShip.set(row.shipment_id, row);
-    }
+    for (const row of (data || [])) if (!porShip.has(row.shipment_id)) porShip.set(row.shipment_id, row);
     const unicos = Array.from(porShip.values());
-    const totalFlex    = unicos.filter(r => r.tipo === 'flex').length;
-    const totalColecta = unicos.filter(r => r.tipo === 'colecta').length;
-
-    // Ordenado por SKU para reimprimir tandas completas
-    unicos.sort((a, b) =>
-      (a.sku || 'zzz').localeCompare(b.sku || 'zzz', 'es', { numeric: true }));
-
+    unicos.sort((a, b) => (a.sku || 'zzz').localeCompare(b.sku || 'zzz', 'es', { numeric: true }));
     res.json({
       total: unicos.length,
-      total_flex: totalFlex,
-      total_colecta: totalColecta,
+      total_flex: unicos.filter(r => r.tipo === 'flex').length,
+      total_colecta: unicos.filter(r => r.tipo === 'colecta').length,
       impresas: unicos
     });
-  } catch (e) {
-    console.error('[IMPRESAS] error:', e.message);
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { console.error('[IMPRESAS]', e.message); res.status(500).json({ error: e.message }); }
 });
 
-// ── Endpoint: reimprimir (uno, varios o toda una tanda de hoy) ────
-// Uso:  ?ids=123,456   |   ?tipo=flex   |   ?tipo=colecta
 app.get('/api/despacho/reimprimir', async (req, res) => {
   try {
     const tipo = (req.query.tipo || '').toLowerCase();
     const idsParam = (req.query.ids || '').trim();
-
     let lista = [];
     if (idsParam) {
-      // Reimpresión puntual de IDs concretos: traemos su SKU del registro
       const ids = idsParam.split(',').map(s => s.trim()).filter(Boolean);
-      const { data } = await supabase.from('dep_impresiones')
-        .select('shipment_id,sku').in('shipment_id', ids);
+      const { data } = await supabase.from('dep_impresiones').select('shipment_id,sku').in('shipment_id', ids);
       const skuPorId = new Map((data || []).map(r => [r.shipment_id, r.sku]));
       lista = ids.map(id => ({ shipment_id: id, sku: skuPorId.get(id) || '' }));
     } else if (tipo === 'flex' || tipo === 'colecta') {
-      // Reimpresión de toda la tanda impresa hoy
       const { data } = await supabase.from('dep_impresiones')
-        .select('shipment_id,sku,impreso_at')
-        .eq('tipo', tipo).gte('impreso_at', inicioDeHoyART());
+        .select('shipment_id,sku,impreso_at').eq('tipo', tipo).gte('impreso_at', inicioDeHoyART());
       const porShip = new Map();
       for (const r of (data || [])) if (!porShip.has(r.shipment_id)) porShip.set(r.shipment_id, r);
       lista = Array.from(porShip.values());
-    } else {
-      return res.status(400).json({ error: 'Indicá ?ids= o ?tipo=flex|colecta' });
-    }
-
-    if (lista.length === 0) return res.status(404).json({ error: 'No hay nada para reimprimir' });
-
+    } else { return res.status(400).json({ error: 'Indicá ?ids= o ?tipo=flex|colecta' }); }
+    if (!lista.length) return res.status(404).json({ error: 'No hay nada para reimprimir' });
     lista.sort((a, b) => (a.sku || 'zzz').localeCompare(b.sku || 'zzz', 'es', { numeric: true }));
-
     const token = await getValidToken(ML_USER_ID);
     const { bytes, impresos, fallidas } = await armarPdf(lista, token);
     console.log(`[REIMPRIMIR] pedidas=${lista.length} unidas=${impresos.length} fallidas=${fallidas}`);
-    const fecha = new Date().toISOString().substring(0, 10);
-    pdfResponse(res, bytes, impresos.length, fallidas, `reimpresion_${fecha}.pdf`);
-  } catch (e) {
-    console.error('[REIMPRIMIR] error:', e.message);
-    res.status(500).json({ error: e.message });
-  }
+    pdfResponse(res, bytes, impresos.length, fallidas, `reimpresion_${fechaHoyART()}.pdf`);
+  } catch (e) { console.error('[REIMPRIMIR]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// ── Endpoints: código de autorización del día ─────────────────────
+app.get('/api/despacho/codigo', async (_req, res) => {
+  try {
+    const { data, error } = await supabase.from('dep_codigo_autorizacion')
+      .select('*').order('fecha', { ascending: false }).limit(1);
+    if (error) throw new Error(error.message);
+    const row = data && data[0];
+    if (!row) return res.json({ codigo: null });
+    res.json({ codigo: row.codigo, fecha: row.fecha, es_de_hoy: row.fecha === fechaHoyART() });
+  } catch (e) { console.error('[CODIGO GET]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/despacho/codigo', async (req, res) => {
+  try {
+    const codigo = ((req.body && req.body.codigo) || '').trim();
+    if (!codigo) return res.status(400).json({ error: 'Falta el código' });
+    const hoy = fechaHoyART();
+    const { error } = await supabase.from('dep_codigo_autorizacion')
+      .upsert({ fecha: hoy, codigo, cargado_at: new Date().toISOString() }, { onConflict: 'fecha' });
+    if (error) throw new Error(error.message);
+    res.json({ ok: true, codigo, fecha: hoy, es_de_hoy: true });
+  } catch (e) { console.error('[CODIGO POST]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// ── Endpoint: colectas del día (transportista, patente, horario) ──
+app.get('/api/despacho/colectas', async (_req, res) => {
+  try {
+    const token = await getValidToken(ML_USER_ID);
+    if (!token) throw new Error('No hay token de ML disponible');
+    const dia = diaSemanaHoyART();
+    const colectas = [];
+    for (const [tanda, logistic] of [['colecta', 'cross_docking'], ['flex', 'self_service']]) {
+      try {
+        const r = await fetch(
+          `https://api.mercadolibre.com/users/${ML_USER_ID}/shipping/schedule/${logistic}`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        const data = await r.json();
+        const hoy = data && data.schedule && data.schedule[dia];
+        if (hoy && hoy.work && Array.isArray(hoy.detail)) {
+          for (const d of hoy.detail) {
+            colectas.push({
+              tanda,
+              from:     d.from   || '',
+              to:       d.to     || '',
+              cutoff:   d.cutoff || '',
+              carrier:  (d.carrier && d.carrier.name) || '',
+              patente:  (d.vehicle && d.vehicle.license_plate) || '',
+              vehiculo: (d.vehicle && d.vehicle.vehicle_type) || '',
+              chofer:   (d.driver && d.driver.name) || '',
+              solo_hoy: !!(d.vehicle && d.vehicle.only_for_today)
+            });
+          }
+        }
+      } catch (e) { console.error('[COLECTAS]', logistic, e.message); }
+    }
+    res.json({ dia, colectas });
+  } catch (e) { console.error('[COLECTAS]', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '1.2' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '2.0' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

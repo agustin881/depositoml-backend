@@ -1,0 +1,16 @@
+{
+  "name": "deposito-backend",
+  "version": "1.0.0",
+  "description": "Backend de la app de deposito (impresion de etiquetas por SKU)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "node-fetch": "^2.7.0",
+    "pdf-lib": "^1.17.1"
+  }
+}

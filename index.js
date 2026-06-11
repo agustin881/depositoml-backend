@@ -1,5 +1,5 @@
 // ============================================================
-//  DEPÓSITO · BACKEND  v3
+//  DEPÓSITO · BACKEND  v2.3
 //  Fase 1: impresión por SKU + registro + reimpresión + conteo
 //  Fase 2 (parcial): código de autorización del día + colectas del día
 //  App separada de MargenML. Comparte la base Supabase
@@ -189,40 +189,101 @@ async function obtenerEnvios(tipo) {
 }
 
 // ── Helper: pedir etiquetas y armar el PDF en orden ───────────────
-// Junta TODAS las etiquetas primero (en orden por SKU) y manda las
-// hojas de detalle/remito al final del archivo.
-async function armarPdf(shipments, token) {
-  const buffers = await poolMap(shipments, 5, async (s) => {
-    const r = await fetch(
-      `https://api.mercadolibre.com/shipment_labels?shipment_ids=${s.shipment_id}&response_type=pdf`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-    if (!r.ok) { console.error(`[ETIQUETA] ship=${s.shipment_id} HTTP ${r.status}`); return null; }
-    return await r.buffer();
-  });
+// Pide las etiquetas a ML en LOTES de hasta 50 envíos por llamada
+// (manteniendo el orden por SKU). En el PDF final van primero TODAS
+// las etiquetas y al final del archivo las hojas de detalle/remito.
+// Si un lote falla, ese lote se reintenta pidiendo de a un envío.
+const LOTE_ETIQUETAS = 50;
 
+async function armarPdf(shipments, token) {
   const etiquetas = await PDFDocument.create();
   const detalles  = await PDFDocument.create();
   const impresos = []; let fallidas = 0;
 
-  for (let i = 0; i < buffers.length; i++) {
-    const buf = buffers[i];
-    if (!buf || buf.__error) { fallidas++; continue; }
+  // Procesa un envío individual: página 0 = etiqueta, resto = detalle
+  async function pedirUno(s) {
     try {
-      const src = await PDFDocument.load(buf);
-      const idx = src.getPageIndices();
-      // Página 0 = etiqueta; el resto (1+) = hoja de detalle / remito
-      const [lab] = await etiquetas.copyPages(src, [idx[0]]);
-      etiquetas.addPage(lab);
-      if (idx.length > 1) {
-        const dets = await detalles.copyPages(src, idx.slice(1));
-        dets.forEach(p => detalles.addPage(p));
+      const r = await fetch(
+        `https://api.mercadolibre.com/shipment_labels?shipment_ids=${s.shipment_id}&response_type=pdf`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!r.ok) { console.error(`[ETIQUETA] ship=${s.shipment_id} HTTP ${r.status}`); return null; }
+      return await r.buffer();
+    } catch (e) { console.error(`[ETIQUETA] ship=${s.shipment_id}: ${e.message}`); return null; }
+  }
+
+  async function unirIndividual(chunk) {
+    const buffers = await poolMap(chunk, 5, pedirUno);
+    for (let i = 0; i < buffers.length; i++) {
+      const buf = buffers[i];
+      if (!buf || buf.__error) { fallidas++; continue; }
+      try {
+        const src = await PDFDocument.load(buf);
+        const idx = src.getPageIndices();
+        const [lab] = await etiquetas.copyPages(src, [idx[0]]);
+        etiquetas.addPage(lab);
+        if (idx.length > 1) {
+          const dets = await detalles.copyPages(src, idx.slice(1));
+          dets.forEach(p => detalles.addPage(p));
+        }
+        impresos.push(chunk[i]);
+      } catch (e) {
+        console.error(`[ETIQUETA] unir ship=${chunk[i].shipment_id}: ${e.message}`);
+        fallidas++;
       }
-      impresos.push(shipments[i]);
-    } catch (e) {
-      console.error(`[ETIQUETA] unir ship=${shipments[i].shipment_id}: ${e.message}`);
-      fallidas++;
     }
+  }
+
+  // Partir en lotes de hasta 50, respetando el orden por SKU
+  const lotes = [];
+  for (let i = 0; i < shipments.length; i += LOTE_ETIQUETAS) {
+    lotes.push(shipments.slice(i, i + LOTE_ETIQUETAS));
+  }
+
+  for (const lote of lotes) {
+    // Un solo envío: directo por la vía individual (mismo resultado)
+    if (lote.length === 1) { await unirIndividual(lote); continue; }
+
+    let buf = null;
+    try {
+      const ids = lote.map(s => s.shipment_id).join(',');
+      const r = await fetch(
+        `https://api.mercadolibre.com/shipment_labels?shipment_ids=${ids}&response_type=pdf`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (r.ok) buf = await r.buffer();
+      else console.error(`[ETIQUETAS] lote de ${lote.length} HTTP ${r.status} → reintento de a uno`);
+    } catch (e) {
+      console.error(`[ETIQUETAS] lote de ${lote.length}: ${e.message} → reintento de a uno`);
+    }
+
+    let unido = false;
+    if (buf) {
+      try {
+        const src = await PDFDocument.load(buf);
+        const total = src.getPageCount();
+        // En el PDF por lote, ML pone primero 1 página de etiqueta por envío
+        // (en el orden pedido) y al final las hojas de detalle consolidadas.
+        if (total >= lote.length) {
+          const labIdx = Array.from({ length: lote.length }, (_, i) => i);
+          const labs = await etiquetas.copyPages(src, labIdx);
+          labs.forEach(p => etiquetas.addPage(p));
+          if (total > lote.length) {
+            const detIdx = Array.from({ length: total - lote.length }, (_, i) => lote.length + i);
+            const dets = await detalles.copyPages(src, detIdx);
+            dets.forEach(p => detalles.addPage(p));
+          }
+          impresos.push(...lote);
+          unido = true;
+        } else {
+          console.error(`[ETIQUETAS] lote devolvió ${total} páginas para ${lote.length} envíos → reintento de a uno`);
+        }
+      } catch (e) {
+        console.error(`[ETIQUETAS] lote ilegible: ${e.message} → reintento de a uno`);
+      }
+    }
+    if (!unido) await unirIndividual(lote);
+    await sleep(200);
   }
 
   // Combinar: primero todas las etiquetas (orden SKU), después los detalles
@@ -234,6 +295,36 @@ async function armarPdf(shipments, token) {
 
   const bytes = await merged.save();
   return { bytes, impresos, fallidas };
+}
+
+// ── Helper: número de venta (o Pack ID) → datos del envío ─────────
+async function resolverShipmentPorVenta(venta, token) {
+  let r = await fetch(`https://api.mercadolibre.com/orders/${venta}?access_token=${token}`);
+  let order = await r.json();
+
+  // Si no es una orden, probamos como Pack ID (las etiquetas de packs muestran ese número)
+  if (order.error || !order.id) {
+    try {
+      const rp = await fetch(`https://api.mercadolibre.com/packs/${venta}`,
+        { headers: { Authorization: `Bearer ${token}` } });
+      const pack = await rp.json();
+      const oid = pack && pack.orders && pack.orders[0] && pack.orders[0].id;
+      if (!oid) return null;
+      r = await fetch(`https://api.mercadolibre.com/orders/${oid}?access_token=${token}`);
+      order = await r.json();
+      if (order.error || !order.id) return null;
+    } catch (e) { return null; }
+  }
+
+  const shipId = order.shipping && order.shipping.id;
+  if (!shipId) return null;
+  const item = (order.order_items && order.order_items[0]) || {};
+  return {
+    shipment_id: String(shipId),
+    nro_venta: String(order.id),
+    sku: (item.item && (item.item.seller_sku || item.item.seller_custom_field)) || '',
+    titulo: (item.item && item.item.title) || ''
+  };
 }
 
 async function registrarImpresion(impresos, tipo) {
@@ -311,8 +402,15 @@ app.get('/api/despacho/reimprimir', async (req, res) => {
   try {
     const tipo = (req.query.tipo || '').toLowerCase();
     const idsParam = (req.query.ids || '').trim();
+    const ventaParam = (req.query.venta || '').trim().replace(/\s+/g, '');
     let lista = [];
-    if (idsParam) {
+    if (ventaParam) {
+      const token0 = await getValidToken(ML_USER_ID);
+      if (!token0) throw new Error('No hay token de ML disponible');
+      const s = await resolverShipmentPorVenta(ventaParam, token0);
+      if (!s) return res.status(404).json({ error: 'No encontré esa venta (o no tiene envío asociado). Revisá el número.' });
+      lista = [s];
+    } else if (idsParam) {
       const ids = idsParam.split(',').map(s => s.trim()).filter(Boolean);
       const { data } = await supabase.from('dep_impresiones').select('shipment_id,sku').in('shipment_id', ids);
       const skuPorId = new Map((data || []).map(r => [r.shipment_id, r.sku]));
@@ -323,13 +421,14 @@ app.get('/api/despacho/reimprimir', async (req, res) => {
       const porShip = new Map();
       for (const r of (data || [])) if (!porShip.has(r.shipment_id)) porShip.set(r.shipment_id, r);
       lista = Array.from(porShip.values());
-    } else { return res.status(400).json({ error: 'Indicá ?ids= o ?tipo=flex|colecta' }); }
+    } else { return res.status(400).json({ error: 'Indicá ?venta=, ?ids= o ?tipo=flex|colecta' }); }
     if (!lista.length) return res.status(404).json({ error: 'No hay nada para reimprimir' });
     lista.sort((a, b) => (a.sku || 'zzz').localeCompare(b.sku || 'zzz', 'es', { numeric: true }));
     const token = await getValidToken(ML_USER_ID);
     const { bytes, impresos, fallidas } = await armarPdf(lista, token);
     console.log(`[REIMPRIMIR] pedidas=${lista.length} unidas=${impresos.length} fallidas=${fallidas}`);
-    pdfResponse(res, bytes, impresos.length, fallidas, `reimpresion_${fechaHoyART()}.pdf`);
+    const nombre = ventaParam ? `reimpresion_venta_${ventaParam}.pdf` : `reimpresion_${fechaHoyART()}.pdf`;
+    pdfResponse(res, bytes, impresos.length, fallidas, nombre);
   } catch (e) { console.error('[REIMPRIMIR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
@@ -450,7 +549,7 @@ app.get('/api/despacho/buscar', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '2.2' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '2.3' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

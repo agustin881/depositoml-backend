@@ -7,6 +7,9 @@ const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
+// Marcador de version (para verificar que Railway tiene el codigo nuevo)
+app.get('/api/version', (req, res) => res.json({ version: 'backfill-update-v3', costo_congelado: true }));
+
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
@@ -745,13 +748,19 @@ app.post('/api/costos/backfill', requireAuth, async (req, res) => {
       updates.push({ nro_venta: v.nro_venta, costo_congelado: Math.round(costo_u * unidades * 100) / 100 });
     }
 
-    for (let i = 0; i < updates.length; i += 500) {
-      const { error } = await supabase.from('ventas')
-        .upsert(updates.slice(i, i + 500), { onConflict: 'nro_venta' });
-      if (error) return res.status(500).json({ error: error.message });
+    let actualizadas = 0;
+    for (let i = 0; i < updates.length; i += 50) {
+      const lote = updates.slice(i, i + 50);
+      const resultados = await Promise.all(lote.map(u =>
+        supabase.from('ventas')
+          .update({ costo_congelado: u.costo_congelado })
+          .eq('user_id', userId)
+          .eq('nro_venta', u.nro_venta)
+      ));
+      for (const r of resultados) { if (!r.error) actualizadas++; }
     }
 
-    res.json({ ventas: ventas.length, exacto, aprox, sin, actualizadas: updates.length });
+    res.json({ ventas: ventas.length, exacto, aprox, sin, actualizadas });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

@@ -464,6 +464,52 @@ function pdfResponse(res, bytes, ok, fallidas, nombre) {
   res.send(Buffer.from(bytes));
 }
 
+// ══════════════════════════════════════════════════════════════════
+//  WEBHOOKS de Mercado Libre (PÚBLICO · va ANTES del requireAuth)
+//  ML postea acá cada vez que algo cambia. Por ahora solo lo
+//  REGISTRAMOS para diagnosticar qué llega; en el próximo paso lo
+//  usamos para mantener la foto local al día.
+//  URL a registrar en ML DevCenter:
+//    https://<backend>/api/despacho/webhook
+// ══════════════════════════════════════════════════════════════════
+app.post('/api/despacho/webhook', async (req, res) => {
+  // Responder 200 rápido SIEMPRE (si tardás, ML reintenta y te penaliza)
+  res.sendStatus(200);
+  try {
+    const n = req.body || {};
+    console.log(`[WEBHOOK] topic=${n.topic || '?'} resource=${n.resource || '?'} user=${n.user_id || '?'}`);
+    await supabase.from('dep_webhooks').insert({
+      topic: n.topic || null,
+      resource: n.resource || null,
+      ml_user_id: n.user_id ? String(n.user_id) : null,
+      application_id: n.application_id ? String(n.application_id) : null,
+      attempts: n.attempts || null,
+      sent: n.sent || null,
+      received_at: new Date().toISOString(),
+      raw: n
+    });
+  } catch (e) { console.error('[WEBHOOK]', e.message); }
+});
+
+// Inspección de los últimos webhooks recibidos (con clave, para el navegador)
+app.get('/api/despacho/webhook-diag', async (req, res) => {
+  if ((req.query.clave || '') !== 'pontec2026')
+    return res.status(401).json({ error: 'Agregá ?clave=pontec2026 al final de la URL' });
+  try {
+    const { data, error } = await supabase.from('dep_webhooks')
+      .select('topic,resource,ml_user_id,application_id,received_at')
+      .order('received_at', { ascending: false }).limit(50);
+    if (error) throw new Error(error.message);
+    const porTopic = (data || []).reduce((a, w) => { const k = w.topic || '(vacío)'; a[k] = (a[k]||0)+1; return a; }, {});
+    res.json({
+      total_ultimos_50: (data || []).length,
+      por_topic: porTopic,
+      ultimo: (data && data[0]) ? data[0].received_at : null,
+      detalle: data || []
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── Todos los endpoints del depósito exigen estar logueado ────────
 app.use('/api/despacho', requireAuth);
 
@@ -1047,7 +1093,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '3.4' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '3.5-diag-webhooks' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

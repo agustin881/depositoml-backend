@@ -40,6 +40,34 @@ const DEPOSITO_FILTRO = normalizar(
   process.env.DEPOSITO_FILTRO !== undefined ? process.env.DEPOSITO_FILTRO : 'soriano'
 );
 
+// ── MODO DEMO · helpers y semilla (datos de prueba) ───────────────
+// Los envíos demo viven en dep_demo y usan shipment_id con prefijo
+// "DEMO-". El escaneo y el seguimiento los reconocen por ese prefijo,
+// así nunca se mezclan con datos reales ni le pegan a la API de ML.
+const ES_DEMO = id => String(id || '').startsWith('DEMO-');
+
+const SEMILLA_DEMO = [
+  { sku: 'BACK003-GR',  titulo: 'Mochila Porta Notebook Muy Segura',     tipo: 'flex',    status: 'ready_to_ship', preparar: false, despachar: false },
+  { sku: 'BIC06',       titulo: 'Maquina Cuenta Dinero Contadora',       tipo: 'flex',    status: 'ready_to_ship', preparar: true,  despachar: false },
+  { sku: 'GAB100',      titulo: 'Gaveta 5 Compartimientos Registradora', tipo: 'colecta', status: 'ready_to_ship', preparar: true,  despachar: false },
+  { sku: 'KH-ESC80',    titulo: 'Escritorio Koa Home 80 Melamina',       tipo: 'flex',    status: 'ready_to_ship', preparar: true,  despachar: true  },
+  { sku: 'MTF1000NP',   titulo: 'Rack Tv Flotante Modular Negro',        tipo: 'colecta', status: 'shipped',       preparar: true,  despachar: true  },
+  { sku: 'PER100-BL',   titulo: 'Perchero Comercial Metalico Blanco',    tipo: 'colecta', status: 'delivered',     preparar: true,  despachar: true  },
+  { sku: 'STL150-NE',   titulo: 'Cochecito Paragüitas Cartan Stl150',    tipo: 'flex',    status: 'not_delivered', preparar: true,  despachar: true  },
+  { sku: 'REF050-6500K',titulo: 'Reflector Proyector Led 50w Ip66',      tipo: 'flex',    status: 'cancelled',     preparar: true,  despachar: false }
+];
+
+async function obtenerDemo() {
+  const { data, error } = await supabase.from('dep_demo')
+    .select('shipment_id,nro_venta,sku,titulo,tipo,status,limite');
+  if (error) { console.error('[DEMO] leer:', error.message); return []; }
+  return (data || []).map(d => ({
+    shipment_id: d.shipment_id, nro_venta: d.nro_venta, sku: d.sku, titulo: d.titulo,
+    logistic: d.tipo === 'flex' ? 'self_service' : d.tipo === 'colecta' ? 'cross_docking' : d.tipo,
+    status: d.status, substatus: '', limite: d.limite, dep_id: '', dep_dir: '', _demo: true
+  }));
+}
+
 // Estados de envío de ML traducidos
 const ESTADO_ES = {
   pending:        'Pendiente',
@@ -694,6 +722,36 @@ app.post('/api/despacho/despachar', async (req, res) => {
     const token = await getValidToken(ML_USER_ID);
     if (!token) throw new Error('No hay token de ML disponible');
 
+    // ── Rama DEMO: si la venta/envío es de prueba, resolvemos local ──
+    const numsDemo = extraerNumeros(codigo);
+    const ventaDemo = numsDemo.find(n => n.startsWith('2000099000'));
+    if (ventaDemo || ES_DEMO(codigo)) {
+      const { data: dd } = await supabase.from('dep_demo')
+        .select('shipment_id,nro_venta,sku,titulo,tipo,status')
+        .or(`nro_venta.eq.${ventaDemo || codigo},shipment_id.eq.${codigo}`).limit(1);
+      const dv = dd && dd[0];
+      if (!dv) return res.status(404).json({ error: 'Venta de prueba no encontrada. Volvé a sembrar el demo.' });
+      const base = { shipment_id: dv.shipment_id, nro_venta: dv.nro_venta, sku: dv.sku, titulo: dv.titulo, tipo: dv.tipo, demo: true };
+      if (dv.status === 'cancelled')
+        return res.json({ resultado: 'cancelada', mensaje: 'NO DESPACHAR · la venta está CANCELADA', ...base });
+      const { data: dup } = await supabase.from('dep_despachos')
+        .select('despachado_at,usuario').eq('shipment_id', dv.shipment_id)
+        .order('despachado_at', { ascending: false }).limit(1);
+      if (dup && dup[0])
+        return res.json({ resultado: 'duplicada', mensaje: 'Este envío ya estaba escaneado',
+          despachado_at: dup[0].despachado_at, usuario: dup[0].usuario || '', ...base });
+      const { error } = await supabase.from('dep_despachos').insert({
+        shipment_id: dv.shipment_id, nro_venta: dv.nro_venta, sku: dv.sku, titulo: dv.titulo,
+        tipo: dv.tipo, usuario: (req.authUser && req.authUser.email) || 'demo'
+      });
+      if (error) throw new Error(error.message);
+      let aviso = '';
+      if (dv.status === 'shipped')   aviso = 'Ojo: ML ya la marca en camino.';
+      if (dv.status === 'delivered') aviso = 'Ojo: ML ya la marca entregada.';
+      console.log(`[DESPACHAR][DEMO] OK ship=${dv.shipment_id} venta=${dv.nro_venta}`);
+      return res.json({ resultado: 'ok', mensaje: 'Despachada (demo)', aviso, ...base });
+    }
+
     const s = await resolverEscaneo(codigo, token);
     if (!s) return res.status(404).json({ error: 'No pude interpretar el código. Probá con el número de venta o el número de envío de la etiqueta.' });
 
@@ -797,7 +855,9 @@ app.get('/api/despacho/seguimiento', async (_req, res) => {
   try {
     const token = await getValidToken(ML_USER_ID);
     if (!token) throw new Error('No hay token de ML disponible');
-    const detallados = await obtenerDetalladosConCache(token);
+    const reales = await obtenerDetalladosConCache(token);
+    const demo = await obtenerDemo();
+    const detallados = [...reales, ...demo];
     const ids = detallados.map(s => s.shipment_id);
 
     let impSet = new Set(), desMap = new Map();
@@ -844,8 +904,135 @@ app.get('/api/despacho/seguimiento', async (_req, res) => {
   } catch (e) { console.error('[SEGUIMIENTO]', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// ══════════════════════════════════════════════════════════════════
+//  MODO DEMO · endpoints (los helpers ES_DEMO/SEMILLA_DEMO/obtenerDemo
+//  están definidos arriba, junto a las constantes)
+// ══════════════════════════════════════════════════════════════════
+app.post('/api/despacho/demo/sembrar', async (req, res) => {
+  try {
+    // Limpiamos demo anterior para empezar de cero
+    await supabase.from('dep_despachos').delete().like('shipment_id', 'DEMO-%');
+    await supabase.from('dep_impresiones').delete().like('shipment_id', 'DEMO-%');
+    await supabase.from('dep_demo').delete().neq('shipment_id', '');
+
+    const hoy = fechaHoyART();
+    const filasDemo = [], filasImp = [], filasDesp = [];
+    let i = 0;
+    for (const s of SEMILLA_DEMO) {
+      i++;
+      const shipId = `DEMO-${Date.now()}-${i}`;
+      const venta  = `2000099000${String(i).padStart(4, '0')}`;
+      filasDemo.push({
+        shipment_id: shipId, nro_venta: venta, sku: s.sku, titulo: s.titulo,
+        tipo: s.tipo, status: s.status, limite: hoy
+      });
+      if (s.preparar) filasImp.push({
+        shipment_id: shipId, nro_venta: venta, sku: s.sku, titulo: s.titulo, tipo: s.tipo
+      });
+      if (s.despachar) filasDesp.push({
+        shipment_id: shipId, nro_venta: venta, sku: s.sku, titulo: s.titulo, tipo: s.tipo,
+        usuario: 'demo', colecta_carrier: s.tipo === 'colecta' ? 'Andreani' : null,
+        colecta_patente: s.tipo === 'colecta' ? 'AB123CD' : null,
+        colecta_horario: s.tipo === 'colecta' ? '14:00-16:00' : null
+      });
+    }
+    if (filasDemo.length) { const { error } = await supabase.from('dep_demo').insert(filasDemo); if (error) throw new Error('dep_demo: ' + error.message); }
+    if (filasImp.length)  { const { error } = await supabase.from('dep_impresiones').insert(filasImp); if (error) throw new Error('dep_impresiones: ' + error.message); }
+    if (filasDesp.length) { const { error } = await supabase.from('dep_despachos').insert(filasDesp); if (error) throw new Error('dep_despachos: ' + error.message); }
+
+    // Envío de prueba "listo para escanear" (impreso pero sin despachar)
+    const listoParaEscanear = filasDemo.find(d =>
+      filasImp.some(im => im.shipment_id === d.shipment_id) &&
+      !filasDesp.some(de => de.shipment_id === d.shipment_id) &&
+      d.status === 'ready_to_ship');
+    // Envío de prueba cancelado (para ver la alerta NO DESPACHAR)
+    const cancelado = filasDemo.find(d => d.status === 'cancelled');
+
+    console.log(`[DEMO] sembrados ${filasDemo.length} envíos de prueba`);
+    res.json({
+      ok: true, total: filasDemo.length,
+      probar_ok:       listoParaEscanear ? listoParaEscanear.nro_venta : null,
+      probar_cancelada: cancelado ? cancelado.nro_venta : null
+    });
+  } catch (e) { console.error('[DEMO]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/despacho/demo/limpiar', async (_req, res) => {
+  try {
+    await supabase.from('dep_despachos').delete().like('shipment_id', 'DEMO-%');
+    await supabase.from('dep_impresiones').delete().like('shipment_id', 'DEMO-%');
+    await supabase.from('dep_demo').delete().neq('shipment_id', '');
+    console.log('[DEMO] datos de prueba eliminados');
+    res.json({ ok: true });
+  } catch (e) { console.error('[DEMO]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// ── Endpoint: DIAGNÓSTICO (qué llega de ML y dónde se pierde) ──────
+// No filtra: cuenta envíos por estado, por logística y por depósito.
+// Sirve para entender por qué "no trae nada". Ver en el navegador:
+//   /api/despacho/diag
+app.get('/api/despacho/diag', async (_req, res) => {
+  try {
+    const token = await getValidToken(ML_USER_ID);
+    if (!token) throw new Error('No hay token de ML disponible');
+
+    // Traemos SIN usar caché ni filtro de depósito
+    const desde = new Date(); desde.setDate(desde.getDate() - DIAS_BUSQUEDA);
+    const desdeISO = desde.toISOString().substring(0,10) + 'T00:00:00.000-03:00';
+    const hastaISO = new Date().toISOString().substring(0,10) + 'T23:59:59.000-03:00';
+    const ordenes = []; let offset = 0, total = 999;
+    while (offset < Math.min(total, 2000)) {
+      const url = `https://api.mercadolibre.com/orders/search?seller=${ML_USER_ID}`
+        + `&order.status=paid&order.date_created.from=${encodeURIComponent(desdeISO)}`
+        + `&order.date_created.to=${encodeURIComponent(hastaISO)}`
+        + `&sort=date_desc&offset=${offset}&limit=50&access_token=${token}`;
+      const data = await (await fetch(url)).json();
+      if (data.error) return res.json({ paso: 'orders/search', error: data });
+      total = (data.paging && data.paging.total) || 0;
+      for (const o of (data.results || [])) ordenes.push(o);
+      offset += 50; await sleep(150);
+    }
+
+    const ships = [];
+    for (const o of ordenes) {
+      const id = o.shipping && o.shipping.id;
+      if (id) ships.push(String(id));
+    }
+    const unicos = [...new Set(ships)];
+
+    const muestra = unicos.slice(0, 400);
+    const detalle = await poolMap(muestra, 12, async (id) => {
+      try {
+        const ship = await (await fetch(`https://api.mercadolibre.com/shipments/${id}`,
+          { headers: { Authorization: `Bearer ${token}` } })).json();
+        const sa = ship.sender_address || {};
+        return {
+          status: ship.status || '?', substatus: ship.substatus || '',
+          logistic: ship.logistic_type || (ship.logistic && ship.logistic.type) || '?',
+          dep: `${sa.address_line || ''} ${(sa.city && sa.city.name) || ''}`.trim()
+        };
+      } catch (e) { return { status: 'error', substatus: '', logistic: '?', dep: '' }; }
+    });
+
+    const cuenta = (arr, key) => arr.reduce((a, x) => { const k = x[key] || '(vacío)'; a[k] = (a[k]||0)+1; return a; }, {});
+    const deps = {};
+    for (const d of detalle) { const k = d.dep || '(sin dato)'; deps[k] = (deps[k]||0)+1; }
+
+    res.json({
+      ventas_encontradas: ordenes.length,
+      envios_unicos: unicos.length,
+      analizados: detalle.length,
+      por_status: cuenta(detalle, 'status'),
+      por_substatus: cuenta(detalle, 'substatus'),
+      por_logistica: cuenta(detalle, 'logistic'),
+      por_deposito: deps,
+      filtro_deposito_actual: DEPOSITO_FILTRO || '(desactivado)'
+    });
+  } catch (e) { console.error('[DIAG]', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '3.2' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '3.3.1' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

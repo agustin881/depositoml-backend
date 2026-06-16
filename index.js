@@ -29,15 +29,16 @@ const DIAS_BUSQUEDA    = parseInt(process.env.DIAS_BUSQUEDA || '8', 10);
 const LOGISTIC = { flex: 'self_service', colecta: 'cross_docking' };
 
 // Solo trabajamos los envíos que salen de NUESTRO depósito (Rosario).
-// Se compara contra la dirección del depósito de origen del envío,
-// sin importar mayúsculas ni acentos. Configurable en Railway con
-// DEPOSITO_FILTRO (texto a buscar en la dirección, o el ID del depósito).
-// Dejar la variable vacía ("") desactiva el filtro.
+// OJO: ML no manda el nombre de la calle en sender_address, manda la
+// CIUDAD. Los depósitos Full de ML aparecen como "Caseros" y
+// "La Matanza"; el nuestro como "Rosario". Por eso filtramos por la
+// ciudad "rosario" (sin acentos/mayúsculas). Configurable en Railway
+// con DEPOSITO_FILTRO. Dejar la variable en "" desactiva el filtro.
 function normalizar(t) {
   return String(t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 }
 const DEPOSITO_FILTRO = normalizar(
-  process.env.DEPOSITO_FILTRO !== undefined ? process.env.DEPOSITO_FILTRO : 'soriano'
+  process.env.DEPOSITO_FILTRO !== undefined ? process.env.DEPOSITO_FILTRO : 'rosario'
 );
 
 // ── MODO DEMO · helpers y semilla (datos de prueba) ───────────────
@@ -283,16 +284,23 @@ async function obtenerEnvios(tipo) {
   const detallados = await obtenerDetalladosConCache(token);
   const deLaTanda = detallados.filter(s => s.logistic === logisticBuscado);
 
-  // ¿El despacho está programado para más adelante? (cliente eligió recibir después)
+  // Criterio (copiando a ML): "listo para imprimir" = substatus
+  // ready_to_print (o ready_to_ship sin substatus). Los "programados"
+  // son los que ML libera recién en una fecha futura (todavía no
+  // imprimibles): no están ready_to_print y su límite es posterior a hoy.
   const hoy = fechaHoyART();
   const esFuturo = s => s.limite && String(s.limite).substring(0,10) > hoy;
+  const imprimible = s => s.status === 'ready_to_ship' &&
+    (s.substatus === 'ready_to_print' || s.substatus === 'ready_to_ship' || !s.substatus);
 
-  const listos      = deLaTanda.filter(s => s.status === 'ready_to_ship' && !esFuturo(s));
-  const programados = deLaTanda.filter(s => s.status === 'ready_to_ship' && esFuturo(s));
-  // "No listos" = solo lo que todavía está en proceso, NO lo ya despachado/entregado/cancelado
+  const listos      = deLaTanda.filter(s => imprimible(s));
+  const programados = deLaTanda.filter(s => !imprimible(s) && s.status === 'ready_to_ship' && esFuturo(s));
+  // "No listos" = en proceso (in_warehouse, ready_to_pack, packed, etc.),
+  // NO lo ya despachado/entregado/cancelado ni lo ya imprimible/programado.
   const TERMINADOS = ['shipped', 'delivered', 'not_delivered', 'cancelled', 'returned'];
+  const yaContado = new Set([...listos, ...programados].map(s => s.shipment_id));
   const noListos  = deLaTanda.filter(s =>
-    s.status !== 'ready_to_ship' && !TERMINADOS.includes(s.status));
+    !yaContado.has(s.shipment_id) && !TERMINADOS.includes(s.status));
 
   listos.sort(ordenarPorSku); programados.sort(ordenarPorSku); noListos.sort(ordenarPorSku);
   console.log(`[ENVIOS] tipo=${tipo} listos=${listos.length} programados=${programados.length} no_listos=${noListos.length}`);
@@ -874,6 +882,8 @@ app.get('/api/despacho/seguimiento', async (_req, res) => {
 
     const hoy = fechaHoyART();
     const esFuturo = s => s.limite && String(s.limite).substring(0,10) > hoy;
+    const imprimible = s => s.status === 'ready_to_ship' &&
+      (s.substatus === 'ready_to_print' || s.substatus === 'ready_to_ship' || !s.substatus);
     const b = { para_imprimir: [], programados: [], en_preparacion: [],
                 despachadas: [], en_camino: [], entregadas: [], devoluciones: [] };
 
@@ -893,7 +903,7 @@ app.get('/api/despacho/seguimiento', async (_req, res) => {
       else if (s.status === 'cancelled')                    continue; // canceladas sin despachar: afuera
       else if (desMap.has(s.shipment_id))                   b.despachadas.push(fila);
       else if (impSet.has(s.shipment_id))                   b.en_preparacion.push(fila);
-      else if (s.status === 'ready_to_ship' && esFuturo(s)) b.programados.push(fila);
+      else if (!imprimible(s) && esFuturo(s))               b.programados.push(fila);
       else                                                  b.para_imprimir.push(fila);
     }
     for (const k of Object.keys(b)) b[k].sort(ordenarPorSku);
@@ -1037,7 +1047,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '3.3.2' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '3.4' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

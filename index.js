@@ -92,6 +92,8 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 // ── Middleware: exige usuario logueado (token de Supabase) ────────
 async function requireAuth(req, res, next) {
   try {
+    // Excepción temporal: diagnóstico accesible con clave en la URL (para debug)
+    if (req.path === '/diag' && (req.query.clave || '') === 'pontec2026') return next();
     const h = req.headers.authorization || '';
     const token = h.startsWith('Bearer ') ? h.slice(7) : '';
     if (!token) return res.status(401).json({ error: 'No autorizado' });
@@ -969,9 +971,12 @@ app.post('/api/despacho/demo/limpiar', async (_req, res) => {
 
 // ── Endpoint: DIAGNÓSTICO (qué llega de ML y dónde se pierde) ──────
 // No filtra: cuenta envíos por estado, por logística y por depósito.
-// Sirve para entender por qué "no trae nada". Ver en el navegador:
-//   /api/despacho/diag
-app.get('/api/despacho/diag', async (_req, res) => {
+// Sirve para entender por qué "no trae nada".
+// Abrir en el navegador con la clave (temporal, para debug):
+//   /api/despacho/diag?clave=pontec2026
+app.get('/api/despacho/diag', async (req, res) => {
+  if ((req.query.clave || '') !== 'pontec2026')
+    return res.status(401).json({ error: 'Agregá ?clave=pontec2026 al final de la URL' });
   try {
     const token = await getValidToken(ML_USER_ID);
     if (!token) throw new Error('No hay token de ML disponible');
@@ -1032,7 +1037,7 @@ app.get('/api/despacho/diag', async (_req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '3.3.1' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '3.3.2' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

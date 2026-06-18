@@ -1334,14 +1334,25 @@ app.get('/api/despacho/diag', async (req, res) => {
         return {
           status: ship.status || '?', substatus: ship.substatus || '',
           logistic: ship.logistic_type || (ship.logistic && ship.logistic.type) || '?',
-          dep: `${sa.address_line || ''} ${(sa.city && sa.city.name) || ''}`.trim()
+          dep: `${sa.address_line || ''} ${(sa.city && sa.city.name) || ''}`.trim(),
+          printed: !!ship.date_first_printed,   // ¿ML registra que ya se imprimió?
+          date_first_printed: ship.date_first_printed || null
         };
-      } catch (e) { return { status: 'error', substatus: '', logistic: '?', dep: '' }; }
+      } catch (e) { return { status: 'error', substatus: '', logistic: '?', dep: '', printed: false }; }
     });
 
     const cuenta = (arr, key) => arr.reduce((a, x) => { const k = x[key] || '(vacío)'; a[k] = (a[k]||0)+1; return a; }, {});
     const deps = {};
     for (const d of detalle) { const k = d.dep || '(sin dato)'; deps[k] = (deps[k]||0)+1; }
+
+    // Cruce substatus × ¿tiene fecha de impresión? (clave para definir "impresa")
+    const subVsPrinted = {};
+    for (const d of detalle) {
+      const k = d.substatus || '(vacío)';
+      subVsPrinted[k] = subVsPrinted[k] || { total: 0, con_fecha_impresion: 0 };
+      subVsPrinted[k].total++;
+      if (d.printed) subVsPrinted[k].con_fecha_impresion++;
+    }
 
     res.json({
       ventas_encontradas: ordenes.length,
@@ -1351,13 +1362,15 @@ app.get('/api/despacho/diag', async (req, res) => {
       por_substatus: cuenta(detalle, 'substatus'),
       por_logistica: cuenta(detalle, 'logistic'),
       por_deposito: deps,
+      substatus_vs_impresa: subVsPrinted,
+      con_fecha_impresion_total: detalle.filter(d => d.printed).length,
       filtro_deposito_actual: DEPOSITO_FILTRO || '(desactivado)'
     });
   } catch (e) { console.error('[DIAG]', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '4.1-carga-incremental' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '4.1.1-diag-impresa' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

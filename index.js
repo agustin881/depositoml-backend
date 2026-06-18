@@ -94,7 +94,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function requireAuth(req, res, next) {
   try {
     // Excepción temporal: diagnóstico accesible con clave en la URL (para debug)
-    if (req.path === '/diag' && (req.query.clave || '') === 'pontec2026') return next();
+    if ((req.path === '/diag' || req.path === '/diag-envio') && (req.query.clave || '') === 'pontec2026') return next();
     const h = req.headers.authorization || '';
     const token = h.startsWith('Bearer ') ? h.slice(7) : '';
     if (!token) return res.status(401).json({ error: 'No autorizado' });
@@ -1294,6 +1294,67 @@ app.post('/api/despacho/demo/limpiar', async (_req, res) => {
 // Sirve para entender por qué "no trae nada".
 // Abrir en el navegador con la clave (temporal, para debug):
 //   /api/despacho/diag?clave=pontec2026
+// ── DIAGNÓSTICO de UN envío (para ubicar el número del QR de Colecta) ──
+// /api/despacho/diag-envio?clave=pontec2026&venta=2000015060172118
+app.get('/api/despacho/diag-envio', async (req, res) => {
+  if ((req.query.clave || '') !== 'pontec2026')
+    return res.status(401).json({ error: 'Agregá ?clave=pontec2026' });
+  try {
+    const venta = (req.query.venta || '').trim();
+    const buscar = (req.query.buscar || '').trim(); // número a ubicar (ej 46428401827)
+    if (!venta) return res.status(400).json({ error: 'Indicá ?venta=NUMERO' });
+    const token = await getValidToken(ML_USER_ID);
+    if (!token) throw new Error('No hay token de ML disponible');
+
+    const ro = await fetch(`https://api.mercadolibre.com/orders/${venta}?access_token=${token}`);
+    const order = await ro.json();
+    if (order.error || !order.id) return res.json({ paso: 'orders', error: order });
+    const shipId = order.shipping && order.shipping.id;
+    if (!shipId) return res.json({ error: 'La venta no tiene envío asociado', order_status: order.status });
+
+    const rs = await fetch(`https://api.mercadolibre.com/shipments/${shipId}`,
+      { headers: { Authorization: `Bearer ${token}` } });
+    const ship = await rs.json();
+
+    // Buscar dónde aparece el número del QR (si se pasó ?buscar=)
+    let apariciones = [];
+    if (buscar) {
+      const txt = JSON.stringify(ship);
+      const recorrer = (obj, ruta) => {
+        if (obj == null) return;
+        if (typeof obj === 'object') {
+          for (const k of Object.keys(obj)) recorrer(obj[k], ruta ? `${ruta}.${k}` : k);
+        } else if (String(obj) === buscar || String(obj).includes(buscar)) {
+          apariciones.push({ campo: ruta, valor: String(obj) });
+        }
+      };
+      recorrer(ship, '');
+    }
+
+    res.json({
+      nro_venta: String(order.id),
+      shipment_id: String(shipId),
+      pack_id: order.pack_id ? String(order.pack_id) : null,
+      ship_status: ship.status,
+      ship_substatus: ship.substatus,
+      logistic_type: ship.logistic_type || (ship.logistic && ship.logistic.type),
+      tracking_number: ship.tracking_number || null,
+      tracking_method: ship.tracking_method || null,
+      buscado: buscar || null,
+      apariciones_del_buscado: apariciones,
+      // Campos candidatos más comunes, mostrados explícitos
+      candidatos: {
+        id: ship.id, tracking_number: ship.tracking_number,
+        external_reference: ship.external_reference,
+        carrier_info: ship.carrier_info || null,
+        order_id: ship.order_id || null
+      },
+      // Por las dudas, todas las claves de primer nivel del envío
+      claves_envio: Object.keys(ship)
+    });
+  } catch (e) { console.error('[DIAG-ENVIO]', e.message); res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/despacho/diag', async (req, res) => {
   if ((req.query.clave || '') !== 'pontec2026')
     return res.status(401).json({ error: 'Agregá ?clave=pontec2026 al final de la URL' });
@@ -1370,7 +1431,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '4.1.1-diag-impresa' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '4.1.2-diag-envio' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

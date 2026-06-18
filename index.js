@@ -160,7 +160,9 @@ async function poolMap(items, limit, fn) {
 
 // ── Núcleo: traer TODOS los envíos recientes con detalle ──────────
 // (estado, logística, fecha límite de despacho)
-async function obtenerShipmentsDetallados(token) {
+// onLote(filas) opcional: se llama con cada lote de envíos ya detallados,
+// para poder ir guardando en la foto a medida que avanza (carga robusta).
+async function obtenerShipmentsDetallados(token, onLote) {
   const desde = new Date();
   desde.setDate(desde.getDate() - DIAS_BUSQUEDA);
   const desdeISO = desde.toISOString().substring(0,10) + 'T00:00:00.000-03:00';
@@ -193,13 +195,16 @@ async function obtenerShipmentsDetallados(token) {
     if (!porShipment.has(shipId)) {
       porShipment.set(shipId, {
         shipment_id: String(shipId), nro_venta: String(o.id),
+        pack_id: o.pack_id ? String(o.pack_id) : null,
         sku: sku ? String(sku).trim() : '', titulo, unidades: item.quantity || 1
       });
     }
   }
 
   const shipments = Array.from(porShipment.values());
-  const detallados = await poolMap(shipments, 12, async (s) => {
+  console.log(`[ENVIOS] ${ordenes.length} órdenes → ${shipments.length} envíos únicos. Pidiendo detalle…`);
+
+  const traerDetalle = async (s) => {
     try {
       const r = await fetch(`https://api.mercadolibre.com/shipments/${s.shipment_id}`, {
         headers: { Authorization: `Bearer ${token}` }
@@ -215,20 +220,29 @@ async function obtenerShipmentsDetallados(token) {
       s.dep_dir = `${sa.address_line || ''} ${(sa.city && sa.city.name) || ''}`.trim();
     } catch (e) { s.status = 'error'; s.logistic = ''; s.limite = null; s.dep_id = ''; s.dep_dir = ''; }
     return s;
-  });
+  };
 
-  // Filtro por depósito de origen (tenemos más de un depósito en ML;
-  // esta app maneja solo el de Rosario). Si el envío no informa
-  // depósito, lo dejamos pasar para no perder nada.
-  if (DEPOSITO_FILTRO) {
-    const antes = detallados.length;
-    const filtrados = detallados.filter(s =>
-      !s.dep_dir ? true : normalizar(s.dep_dir).includes(DEPOSITO_FILTRO) || s.dep_id === DEPOSITO_FILTRO);
-    const afuera = antes - filtrados.length;
-    if (afuera) console.log(`[ENVIOS] ${afuera} envío(s) de otro depósito quedaron afuera del listado`);
-    return filtrados;
+  const pasaFiltro = (s) =>
+    !DEPOSITO_FILTRO ? true
+      : (!s.dep_dir ? true : normalizar(s.dep_dir).includes(DEPOSITO_FILTRO) || s.dep_id === DEPOSITO_FILTRO);
+
+  // Procesar en bloques: traer detalle (12 en paralelo) y, si hay callback,
+  // guardar ese bloque ya filtrado antes de seguir (carga incremental/robusta).
+  const BLOQUE = 120;
+  const todos = [];
+  let procesados = 0, afuera = 0;
+  for (let i = 0; i < shipments.length; i += BLOQUE) {
+    const bloque = shipments.slice(i, i + BLOQUE);
+    const detallados = await poolMap(bloque, 12, traerDetalle);
+    const delDeposito = detallados.filter(s => { const ok = pasaFiltro(s); if (!ok) afuera++; return ok; });
+    if (onLote && delDeposito.length) { try { await onLote(delDeposito); } catch (e) { console.error('[ENVIOS] onLote', e.message); } }
+    for (const s of delDeposito) todos.push(s);
+    procesados += bloque.length;
+    console.log(`[ENVIOS] progreso ${procesados}/${shipments.length} (acumulado nuestro: ${todos.length})`);
+    await sleep(120);
   }
-  return detallados;
+  if (afuera) console.log(`[ENVIOS] ${afuera} envío(s) de otro depósito quedaron afuera`);
+  return todos;
 }
 
 // ── Foto local: mapear un envío a la fila de dep_envios ───────────
@@ -612,26 +626,36 @@ app.get('/api/despacho/webhook-diag', async (req, res) => {
 app.use('/api/despacho', requireAuth);
 
 // ── FOTO LOCAL: carga inicial / resincronización ──────────────────
-// Llena dep_envios con todo lo reciente. Se corre una vez (o cuando
-// quieras resincronizar). De ahí en más los webhooks la mantienen.
-let _cargandoFoto = false;
+// Llena dep_envios con todo lo reciente, GUARDANDO a medida que avanza
+// (así aunque se corte, lo procesado queda). Los webhooks la mantienen
+// al día después. El estado queda en _fotoCarga para que el panel lo vea.
+let _fotoCarga = { corriendo: false, guardados: 0, desde: null, fin: null };
 app.post('/api/despacho/foto/cargar', async (_req, res) => {
-  if (_cargandoFoto) return res.json({ ok: true, ya_corriendo: true });
-  _cargandoFoto = true;
-  res.json({ ok: true, mensaje: 'Carga iniciada. Mirá el panel en unos segundos.' });
+  if (_fotoCarga.corriendo) return res.json({ ok: true, ya_corriendo: true, guardados: _fotoCarga.guardados });
+  _fotoCarga = { corriendo: true, guardados: 0, desde: new Date().toISOString(), fin: null };
+  res.json({ ok: true, mensaje: 'Carga iniciada. Va guardando a medida que avanza; el panel se va llenando solo.' });
   try {
     const token = await getValidToken(ML_USER_ID);
     if (!token) { console.error('[FOTO-CARGA] sin token'); return; }
-    const detallados = await obtenerShipmentsDetallados(token); // ya viene filtrado por depósito
-    let n = 0;
-    for (let i = 0; i < detallados.length; i += 100) {
-      const lote = detallados.slice(i, i + 100).map(filaEnvio);
-      const { error } = await supabase.from('dep_envios').upsert(lote, { onConflict: 'shipment_id' });
-      if (error) console.error('[FOTO-CARGA] lote', error.message); else n += lote.length;
-    }
-    console.log(`[FOTO-CARGA] ${n} envíos guardados en la foto local`);
+    await obtenerShipmentsDetallados(token, async (lote) => {
+      const filas = lote.map(filaEnvio);
+      const { error } = await supabase.from('dep_envios').upsert(filas, { onConflict: 'shipment_id' });
+      if (error) console.error('[FOTO-CARGA] lote', error.message);
+      else _fotoCarga.guardados += filas.length;
+    });
+    console.log(`[FOTO-CARGA] COMPLETA · ${_fotoCarga.guardados} envíos en la foto local`);
   } catch (e) { console.error('[FOTO-CARGA]', e.message); }
-  finally { _cargandoFoto = false; }
+  finally { _fotoCarga.corriendo = false; _fotoCarga.fin = new Date().toISOString(); }
+});
+
+// Estado de la carga (para que el panel muestre el progreso)
+app.get('/api/despacho/foto/estado', async (_req, res) => {
+  try {
+    const { count } = await supabase.from('dep_envios')
+      .select('shipment_id', { count: 'exact', head: true }).eq('es_nuestro', true);
+    res.json({ corriendo: _fotoCarga.corriendo, guardados_en_esta_carga: _fotoCarga.guardados,
+               total_en_foto: count || 0, desde: _fotoCarga.desde, fin: _fotoCarga.fin });
+  } catch (e) { res.json({ corriendo: _fotoCarga.corriendo, error: e.message }); }
 });
 
 // ── PANEL EN VIVO: lee la foto local (rápido, sin pegarle a ML) ────
@@ -1333,7 +1357,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '4.0-panel-vivo' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '4.1-carga-incremental' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

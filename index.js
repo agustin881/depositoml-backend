@@ -231,6 +231,83 @@ async function obtenerShipmentsDetallados(token) {
   return detallados;
 }
 
+// ── Foto local: mapear un envío a la fila de dep_envios ───────────
+const tipoDeLogistic = lt =>
+  lt === 'self_service' ? 'flex' : lt === 'cross_docking' ? 'colecta' : lt === 'fulfillment' ? 'full' : (lt || 'otro');
+
+function filaEnvio(s) {
+  const lt = s.logistic || '';
+  const dir = s.dep_dir || '';
+  const esNuestro = !DEPOSITO_FILTRO ? true
+    : (!dir ? true : normalizar(dir).includes(DEPOSITO_FILTRO) || s.dep_id === DEPOSITO_FILTRO);
+  return {
+    shipment_id: String(s.shipment_id),
+    nro_venta: s.nro_venta ? String(s.nro_venta) : null,
+    pack_id: s.pack_id ? String(s.pack_id) : null,
+    sku: s.sku || null,
+    titulo: s.titulo || null,
+    unidades: s.unidades || 1,
+    tipo: tipoDeLogistic(lt),
+    status: s.status || null,
+    substatus: s.substatus || null,
+    limite: s.limite ? String(s.limite).substring(0,10) : null,
+    ciudad_depo: dir || null,
+    es_nuestro: esNuestro,
+    cancelada: s.status === 'cancelled',
+    actualizado_at: new Date().toISOString()
+  };
+}
+
+// ── Foto local: traer UN envío de ML y guardarlo (lo usa el webhook) ─
+async function actualizarFotoEnvio(shipmentId, token) {
+  try {
+    const r = await fetch(`https://api.mercadolibre.com/shipments/${shipmentId}`,
+      { headers: { Authorization: `Bearer ${token}` } });
+    if (!r.ok) return false;
+    const ship = await r.json();
+    if (!ship || !ship.id) return false;
+
+    const s = {
+      shipment_id: String(ship.id),
+      status: ship.status || '',
+      substatus: ship.substatus || '',
+      logistic: ship.logistic_type || (ship.logistic && ship.logistic.type) || '',
+      limite: (ship.shipping_option && ship.shipping_option.estimated_handling_limit
+               && ship.shipping_option.estimated_handling_limit.date) || null,
+    };
+    const sa = ship.sender_address || {};
+    s.dep_id = sa.id ? String(sa.id) : '';
+    s.dep_dir = `${sa.address_line || ''} ${(sa.city && sa.city.name) || ''}`.trim();
+
+    // Datos de la orden (SKU, título, venta) — los traemos si el envío los referencia
+    const oid = ship.order_id || (Array.isArray(ship.order_ids) && ship.order_ids[0]);
+    if (oid) {
+      try {
+        const ro = await fetch(`https://api.mercadolibre.com/orders/${oid}?access_token=${token}`);
+        const order = await ro.json();
+        if (order && order.id) {
+          const item = (order.order_items && order.order_items[0]) || {};
+          s.nro_venta = String(order.id);
+          s.pack_id = order.pack_id ? String(order.pack_id) : null;
+          s.sku = (item.item && (item.item.seller_sku || item.item.seller_custom_field)) || '';
+          s.sku = s.sku ? String(s.sku).trim() : '';
+          s.titulo = (item.item && item.item.title) || '';
+          s.unidades = item.quantity || 1;
+          if (order.status === 'cancelled') s.status = s.status || 'cancelled';
+          s._orderStatus = order.status;
+        }
+      } catch (e) { /* seguimos con lo que tengamos del envío */ }
+    }
+
+    const fila = filaEnvio(s);
+    if (s._orderStatus === 'cancelled') fila.cancelada = true;
+    const { error } = await supabase.from('dep_envios').upsert(fila, { onConflict: 'shipment_id' });
+    if (error) { console.error('[FOTO] upsert', error.message); return false; }
+    console.log(`[FOTO] ship=${fila.shipment_id} status=${fila.status}/${fila.substatus} tipo=${fila.tipo} nuestro=${fila.es_nuestro}`);
+    return true;
+  } catch (e) { console.error('[FOTO]', e.message); return false; }
+}
+
 const ordenarPorSku = (a, b) => {
   if (!a.sku && b.sku) return 1;
   if (a.sku && !b.sku) return -1;
@@ -478,7 +555,8 @@ app.post('/api/despacho/webhook', async (req, res) => {
   try {
     const n = req.body || {};
     console.log(`[WEBHOOK] topic=${n.topic || '?'} resource=${n.resource || '?'} user=${n.user_id || '?'}`);
-    await supabase.from('dep_webhooks').insert({
+    // Registro crudo (diagnóstico / auditoría)
+    supabase.from('dep_webhooks').insert({
       topic: n.topic || null,
       resource: n.resource || null,
       ml_user_id: n.user_id ? String(n.user_id) : null,
@@ -487,7 +565,27 @@ app.post('/api/despacho/webhook', async (req, res) => {
       sent: n.sent || null,
       received_at: new Date().toISOString(),
       raw: n
-    });
+    }).then(({ error }) => { if (error) console.error('[WEBHOOK] log', error.message); });
+
+    // Actualizar la FOTO LOCAL del envío afectado (esto da el "tiempo real")
+    const res2 = String(n.resource || '');
+    if (n.topic === 'shipments' && res2.startsWith('/shipments/')) {
+      const shipId = res2.split('/').pop();
+      const token = await getValidToken(n.user_id || ML_USER_ID);
+      if (token && shipId) await actualizarFotoEnvio(shipId, token);
+    } else if ((n.topic === 'orders_v2' || n.topic === 'orders') && res2.includes('/orders/')) {
+      // Una venta cambió: buscamos su envío y refrescamos la foto
+      const orderId = res2.split('/').pop();
+      const token = await getValidToken(n.user_id || ML_USER_ID);
+      if (token && orderId) {
+        try {
+          const ro = await fetch(`https://api.mercadolibre.com/orders/${orderId}?access_token=${token}`);
+          const order = await ro.json();
+          const shipId = order && order.shipping && order.shipping.id;
+          if (shipId) await actualizarFotoEnvio(String(shipId), token);
+        } catch (e) { console.error('[WEBHOOK] orden→envío', e.message); }
+      }
+    }
   } catch (e) { console.error('[WEBHOOK]', e.message); }
 });
 
@@ -512,6 +610,113 @@ app.get('/api/despacho/webhook-diag', async (req, res) => {
 
 // ── Todos los endpoints del depósito exigen estar logueado ────────
 app.use('/api/despacho', requireAuth);
+
+// ── FOTO LOCAL: carga inicial / resincronización ──────────────────
+// Llena dep_envios con todo lo reciente. Se corre una vez (o cuando
+// quieras resincronizar). De ahí en más los webhooks la mantienen.
+let _cargandoFoto = false;
+app.post('/api/despacho/foto/cargar', async (_req, res) => {
+  if (_cargandoFoto) return res.json({ ok: true, ya_corriendo: true });
+  _cargandoFoto = true;
+  res.json({ ok: true, mensaje: 'Carga iniciada. Mirá el panel en unos segundos.' });
+  try {
+    const token = await getValidToken(ML_USER_ID);
+    if (!token) { console.error('[FOTO-CARGA] sin token'); return; }
+    const detallados = await obtenerShipmentsDetallados(token); // ya viene filtrado por depósito
+    let n = 0;
+    for (let i = 0; i < detallados.length; i += 100) {
+      const lote = detallados.slice(i, i + 100).map(filaEnvio);
+      const { error } = await supabase.from('dep_envios').upsert(lote, { onConflict: 'shipment_id' });
+      if (error) console.error('[FOTO-CARGA] lote', error.message); else n += lote.length;
+    }
+    console.log(`[FOTO-CARGA] ${n} envíos guardados en la foto local`);
+  } catch (e) { console.error('[FOTO-CARGA]', e.message); }
+  finally { _cargandoFoto = false; }
+});
+
+// ── PANEL EN VIVO: lee la foto local (rápido, sin pegarle a ML) ────
+// Devuelve todo clasificado por etapa, listo para el panel.
+app.get('/api/despacho/panel', async (_req, res) => {
+  try {
+    // Estados despachados localmente (escaneados al cargar el camión)
+    const { data: desp } = await supabase.from('dep_despachos')
+      .select('shipment_id,despachado_at,colecta_carrier,colecta_patente');
+    const despMap = new Map();
+    for (const d of (desp || [])) if (!despMap.has(d.shipment_id)) despMap.set(d.shipment_id, d);
+
+    // Impresas (alguna vez)
+    const { data: imp } = await supabase.from('dep_impresiones').select('shipment_id');
+    const impSet = new Set((imp || []).map(r => r.shipment_id));
+
+    // Foto local (solo lo nuestro, sin Full)
+    let envios = [], from = 0;
+    while (true) {
+      const { data, error } = await supabase.from('dep_envios')
+        .select('shipment_id,nro_venta,sku,titulo,unidades,tipo,status,substatus,limite,es_nuestro,cancelada,actualizado_at')
+        .eq('es_nuestro', true).neq('tipo', 'full')
+        .range(from, from + 999);
+      if (error) throw new Error(error.message);
+      if (!data || !data.length) break;
+      envios = envios.concat(data);
+      if (data.length < 1000) break;
+      from += 1000;
+    }
+
+    const hoy = fechaHoyART();
+    const esFuturo = s => s.limite && String(s.limite) > hoy;
+    const imprimible = s => s.status === 'ready_to_ship' &&
+      (s.substatus === 'ready_to_print' || s.substatus === 'ready_to_ship' || !s.substatus);
+
+    const etapas = { para_imprimir: [], programados: [], en_preparacion: [],
+                     despachadas: [], en_camino: [], entregadas: [], devoluciones: [] };
+    const TERMINADOS = ['shipped', 'delivered', 'not_delivered', 'returned', 'cancelled'];
+
+    for (const s of envios) {
+      const d = despMap.get(s.shipment_id);
+      const fila = {
+        shipment_id: s.shipment_id, nro_venta: s.nro_venta, sku: s.sku, titulo: s.titulo,
+        unidades: s.unidades || 1, tipo: s.tipo, status: s.status, substatus: s.substatus,
+        estado: ESTADO_ES[s.status] || s.status,
+        limite: s.limite || null,
+        despachado_at: d ? d.despachado_at : null,
+        colecta: d && d.colecta_carrier ? `${d.colecta_carrier}${d.colecta_patente ? ' · ' + d.colecta_patente : ''}` : null
+      };
+      if (s.cancelada || s.status === 'cancelled') {
+        // Cancelada: solo nos importa si ya estaba impresa o despachada (alerta)
+        if (impSet.has(s.shipment_id) || d) { fila.alerta = 'CANCELADA'; etapas.devoluciones.push(fila); }
+        continue;
+      }
+      if (['not_delivered', 'returned'].includes(s.status)) etapas.devoluciones.push(fila);
+      else if (s.status === 'delivered')                    etapas.entregadas.push(fila);
+      else if (s.status === 'shipped')                      etapas.en_camino.push(fila);
+      else if (d)                                           etapas.despachadas.push(fila);
+      else if (impSet.has(s.shipment_id))                   etapas.en_preparacion.push(fila);
+      else if (!imprimible(s) && esFuturo(s))               etapas.programados.push(fila);
+      else if (imprimible(s))                               etapas.para_imprimir.push(fila);
+      // (lo que está en proceso y no imprimible ni futuro queda sin etapa visible)
+    }
+    for (const k of Object.keys(etapas)) etapas[k].sort(ordenarPorSku);
+
+    // Contadores por tanda de lo que está para imprimir
+    const porImprimir = etapas.para_imprimir;
+    const cont = {
+      flex: porImprimir.filter(s => s.tipo === 'flex').length,
+      colecta: porImprimir.filter(s => s.tipo === 'colecta').length
+    };
+
+    // ¿Cuándo se actualizó la foto por última vez?
+    let ultima = null;
+    for (const s of envios) if (!ultima || s.actualizado_at > ultima) ultima = s.actualizado_at;
+
+    res.json({
+      conteos: Object.fromEntries(Object.entries(etapas).map(([k, v]) => [k, v.length])),
+      por_imprimir: cont,
+      total_foto: envios.length,
+      actualizado: ultima,
+      etapas
+    });
+  } catch (e) { console.error('[PANEL]', e.message); res.status(500).json({ error: e.message }); }
+});
 
 // ── Endpoints: impresión ──────────────────────────────────────────
 app.get('/api/despacho/pendientes', async (req, res) => {
@@ -540,6 +745,41 @@ app.get('/api/despacho/etiquetas', async (req, res) => {
     console.log(`[ETIQUETAS] tipo=${tipo} unidas=${impresos.length} fallidas=${fallidas}`);
     pdfResponse(res, bytes, impresos.length, fallidas, `etiquetas_${tipo}_${fechaHoyART()}.pdf`);
   } catch (e) { console.error('[ETIQUETAS]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Imprimir una SELECCIÓN de envíos (desde el panel: tildados o "todos")
+// GET /api/despacho/etiquetas-seleccion?ids=111,222,333
+app.get('/api/despacho/etiquetas-seleccion', async (req, res) => {
+  try {
+    const idsParam = (req.query.ids || '').trim();
+    if (!idsParam) return res.status(400).json({ error: 'Indicá ?ids=' });
+    const ids = idsParam.split(',').map(s => s.trim()).filter(Boolean);
+    if (!ids.length) return res.status(400).json({ error: 'Lista de envíos vacía' });
+
+    // Traemos sku/tipo/venta/título desde la foto local para ordenar y registrar bien
+    const { data } = await supabase.from('dep_envios')
+      .select('shipment_id,sku,tipo,nro_venta,titulo').in('shipment_id', ids);
+    const meta = new Map((data || []).map(r => [r.shipment_id, r]));
+    const lista = ids.map(id => {
+      const m = meta.get(id) || {};
+      return { shipment_id: id, sku: m.sku || '', tipo: m.tipo || '',
+               nro_venta: m.nro_venta || '', titulo: m.titulo || '' };
+    });
+    lista.sort(ordenarPorSku);
+
+    const token = await getValidToken(ML_USER_ID);
+    if (!token) throw new Error('No hay token de ML disponible');
+    const { bytes, impresos, fallidas } = await armarPdf(lista, token);
+    if (!impresos.length) return res.status(404).json({ error: 'No se pudo generar ninguna etiqueta' });
+
+    // Registrar impresión agrupando por tanda
+    const porTipo = {};
+    for (const s of impresos) { (porTipo[s.tipo || 'flex'] = porTipo[s.tipo || 'flex'] || []).push(s); }
+    for (const [tipo, arr] of Object.entries(porTipo)) await registrarImpresion(arr, tipo);
+
+    console.log(`[ETIQUETAS-SEL] pedidas=${lista.length} unidas=${impresos.length} fallidas=${fallidas}`);
+    pdfResponse(res, bytes, impresos.length, fallidas, `etiquetas_seleccion_${fechaHoyART()}.pdf`);
+  } catch (e) { console.error('[ETIQUETAS-SEL]', e.message); res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/despacho/impresas', async (req, res) => {
@@ -1093,7 +1333,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '3.5-diag-webhooks' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '4.0-panel-vivo' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

@@ -94,7 +94,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function requireAuth(req, res, next) {
   try {
     // Excepción temporal: diagnóstico accesible con clave en la URL (para debug)
-    if ((req.path === '/diag' || req.path === '/diag-envio') && (req.query.clave || '') === 'pontec2026') return next();
+    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas') && (req.query.clave || '') === 'pontec2026') return next();
     const h = req.headers.authorization || '';
     const token = h.startsWith('Bearer ') ? h.slice(7) : '';
     if (!token) return res.status(401).json({ error: 'No autorizado' });
@@ -922,6 +922,40 @@ async function colectasDelDia(token) {
   return colectas;
 }
 
+// ── DIAGNÓSTICO de COLECTAS: prueba varias URLs de ML y muestra cuál responde ──
+// /api/despacho/diag-colectas?clave=pontec2026
+app.get('/api/despacho/diag-colectas', async (req, res) => {
+  if ((req.query.clave || '') !== 'pontec2026')
+    return res.status(401).json({ error: 'Agregá ?clave=pontec2026' });
+  try {
+    const token = await getValidToken(ML_USER_ID);
+    if (!token) throw new Error('No hay token de ML disponible');
+    const auth = { headers: { Authorization: `Bearer ${token}` } };
+    const probar = async (url) => {
+      try {
+        const r = await fetch(url, auth);
+        let body; try { body = await r.json(); } catch { body = await r.text(); }
+        const str = JSON.stringify(body);
+        if (str && str.length > 4000) return { url, status: r.status, recortado: true, muestra: str.substring(0, 3500) };
+        return { url, status: r.status, body };
+      } catch (e) { return { url, error: e.message }; }
+    };
+
+    const U = ML_USER_ID;
+    const urls = [
+      `https://api.mercadolibre.com/users/${U}/shipping/schedule/cross_docking`,
+      `https://api.mercadolibre.com/users/${U}/shipping/schedule/self_service`,
+      `https://api.mercadolibre.com/shipping/carrier_collections/search?seller_id=${U}`,
+      `https://api.mercadolibre.com/sites/MLA/shipping_options/collection?seller_id=${U}`,
+      `https://api.mercadolibre.com/users/${U}/shipping_preferences`,
+      `https://api.mercadolibre.com/users/${U}/shipping/modes`
+    ];
+    const resultados = [];
+    for (const u of urls) { resultados.push(await probar(u)); await sleep(150); }
+    res.json({ user_id: U, dia: diaSemanaHoyART(), resultados });
+  } catch (e) { console.error('[DIAG-COLECTAS]', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // ── Endpoint: colectas del día (transportista, patente, horario) ──
 app.get('/api/despacho/colectas', async (_req, res) => {
   try {
@@ -1431,7 +1465,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '4.1.2-diag-envio' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '4.1.3-diag-colectas' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

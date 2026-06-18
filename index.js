@@ -888,6 +888,10 @@ app.post('/api/despacho/codigo', async (req, res) => {
 });
 
 // ── Colectas del día (con caché de 10 min para los escaneos) ──────
+// ML devuelve el horario y el corte de cada colecta de Colecta
+// (cross_docking). El transportista/patente suele venir vacío (ML no
+// lo expone). Flex (self_service) normalmente da 404: no tiene colecta
+// de ML porque lo despacha el vendedor con transporte propio.
 let _colectasCache = { at: 0, colectas: [] };
 async function colectasDelDia(token) {
   if (Date.now() - _colectasCache.at < 10 * 60 * 1000) return _colectasCache.colectas;
@@ -899,6 +903,7 @@ async function colectasDelDia(token) {
         `https://api.mercadolibre.com/users/${ML_USER_ID}/shipping/schedule/${logistic}`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
+      if (!r.ok) continue; // Flex suele dar 404: no tiene colecta de ML
       const data = await r.json();
       const hoy = data && data.schedule && data.schedule[dia];
       if (hoy && hoy.work && Array.isArray(hoy.detail)) {
@@ -912,12 +917,15 @@ async function colectasDelDia(token) {
             patente:  (d.vehicle && d.vehicle.license_plate) || '',
             vehiculo: (d.vehicle && d.vehicle.vehicle_type) || '',
             chofer:   (d.driver && d.driver.name) || '',
+            facility: d.facility_id || '',
             solo_hoy: !!(d.vehicle && d.vehicle.only_for_today)
           });
         }
       }
     } catch (e) { console.error('[COLECTAS]', logistic, e.message); }
   }
+  // Ordenar por hora de inicio
+  colectas.sort((a, b) => (a.from || '').localeCompare(b.from || ''));
   _colectasCache = { at: Date.now(), colectas };
   return colectas;
 }
@@ -1028,42 +1036,79 @@ function extraerNumeros(codigo) {
   return [...new Set(nums)].filter(n => n !== String(ML_USER_ID));
 }
 
-async function resolverEscaneo(codigo, token) {
-  const nums = extraerNumeros(codigo);
-  if (!nums.length) return null;
+// Intepreta lo escaneado y devuelve el shipment_id "candidato".
+// El QR de ML (Flex y Colecta) es un JSON con el campo "id" = shipment_id.
+// Si no es JSON, tomamos el primer número largo (pistola / código de barras).
+function shipmentIdDelEscaneo(codigo) {
+  const txt = String(codigo || '').trim();
+  // ¿Es un JSON tipo {"id":"47315533572",...}?
+  if (txt.startsWith('{')) {
+    try {
+      const o = JSON.parse(txt);
+      if (o && o.id) return { shipId: String(o.id), origen: 'qr_json' };
+    } catch (e) { /* sigue abajo */ }
+  }
+  // ¿Trae "id":"..." aunque no parsee como JSON completo?
+  const m = txt.match(/"id"\s*:\s*"?(\d{6,})"?/);
+  if (m) return { shipId: m[1], origen: 'qr_regex' };
+  return { shipId: null, origen: 'numero' };
+}
 
-  // ¿Parece número de venta / Pack ID? (empiezan con 2000 y son largos)
-  const venta = nums.find(n => n.startsWith('2000') && n.length >= 14);
-  if (venta) {
-    const s = await resolverShipmentPorVenta(venta, token);
-    if (s) return s;
+async function resolverEscaneo(codigo, token) {
+  // 1) Si el QR trae el shipment_id en "id", lo usamos directo
+  const { shipId } = shipmentIdDelEscaneo(codigo);
+
+  // 2) Buscar primero en la FOTO LOCAL (instantáneo, sin pegarle a ML)
+  const tryFoto = async (campo, valor) => {
+    if (!valor) return null;
+    const { data } = await supabase.from('dep_envios')
+      .select('shipment_id,nro_venta,pack_id,sku,titulo,tipo').eq(campo, String(valor)).limit(1);
+    return (data && data[0]) ? data[0] : null;
+  };
+
+  if (shipId) {
+    const f = await tryFoto('shipment_id', shipId);
+    if (f) return { shipment_id: f.shipment_id, nro_venta: f.nro_venta || '', sku: f.sku || '', titulo: f.titulo || '' };
   }
 
-  // Si no, probamos como número de envío (shipment_id)
-  const candidatos = nums.filter(n => n !== venta).sort((a, b) => b.length - a.length);
-  for (const id of candidatos) {
+  // 3) Probar los números sueltos contra la foto (shipment_id, nro_venta, pack_id)
+  const nums = extraerNumeros(codigo);
+  for (const n of nums) {
+    const f = (await tryFoto('shipment_id', n)) || (await tryFoto('nro_venta', n)) || (await tryFoto('pack_id', n));
+    if (f) return { shipment_id: f.shipment_id, nro_venta: f.nro_venta || '', sku: f.sku || '', titulo: f.titulo || '' };
+  }
+
+  // 4) No estaba en la foto: resolver contra ML en vivo (respaldo)
+  const idML = shipId || nums.slice().sort((a, b) => b.length - a.length)[0];
+  if (idML) {
     try {
-      const r = await fetch(`https://api.mercadolibre.com/shipments/${id}`,
+      const r = await fetch(`https://api.mercadolibre.com/shipments/${idML}`,
         { headers: { Authorization: `Bearer ${token}` } });
-      if (!r.ok) continue;
-      const ship = await r.json();
-      if (!ship || !ship.id) continue;
-      const oid = ship.order_id || (Array.isArray(ship.order_ids) && ship.order_ids[0]);
-      if (oid) {
-        const ro = await fetch(`https://api.mercadolibre.com/orders/${oid}?access_token=${token}`);
-        const order = await ro.json();
-        if (order && order.id) {
-          const item = (order.order_items && order.order_items[0]) || {};
-          return {
-            shipment_id: String(ship.id), nro_venta: String(order.id),
-            sku: (item.item && (item.item.seller_sku || item.item.seller_custom_field)) || '',
-            titulo: (item.item && item.item.title) || ''
-          };
+      if (r.ok) {
+        const ship = await r.json();
+        if (ship && ship.id) {
+          const oid = ship.order_id || (Array.isArray(ship.order_ids) && ship.order_ids[0]);
+          if (oid) {
+            const ro = await fetch(`https://api.mercadolibre.com/orders/${oid}?access_token=${token}`);
+            const order = await ro.json();
+            if (order && order.id) {
+              const item = (order.order_items && order.order_items[0]) || {};
+              return {
+                shipment_id: String(ship.id), nro_venta: String(order.id),
+                sku: (item.item && (item.item.seller_sku || item.item.seller_custom_field)) || '',
+                titulo: (item.item && item.item.title) || ''
+              };
+            }
+          }
+          return { shipment_id: String(ship.id), nro_venta: '', sku: '', titulo: '' };
         }
       }
-      return { shipment_id: String(ship.id), nro_venta: '', sku: '', titulo: '' };
-    } catch (e) { /* probar el siguiente */ }
+    } catch (e) { /* nada */ }
   }
+
+  // 5) Último recurso: ¿era un número de venta/pack? resolver por venta
+  const venta = nums.find(n => n.startsWith('2000') && n.length >= 14);
+  if (venta) { const s = await resolverShipmentPorVenta(venta, token); if (s) return s; }
   return null;
 }
 
@@ -1122,12 +1167,13 @@ app.post('/api/despacho/despachar', async (req, res) => {
     }
 
     // Estado actual del ENVÍO
-    let shipStatus = '', tipo = '';
+    let shipStatus = '', shipSub = '', tipo = '';
     try {
       const rs = await fetch(`https://api.mercadolibre.com/shipments/${s.shipment_id}`,
         { headers: { Authorization: `Bearer ${token}` } });
       const ship = await rs.json();
       shipStatus = ship.status || '';
+      shipSub = ship.substatus || '';
       const lt = ship.logistic_type || (ship.logistic && ship.logistic.type) || '';
       tipo = lt === 'self_service' ? 'flex' : lt === 'cross_docking' ? 'colecta' : lt;
     } catch (e) { console.error('[DESPACHAR] check envío:', e.message); }
@@ -1165,11 +1211,19 @@ app.post('/api/despacho/despachar', async (req, res) => {
     });
     if (error) throw new Error(error.message);
 
+    // Criterio (opción 3): bloquear solo si CANCELADA (ya filtrado arriba).
+    // Acá AVISAMOS sin bloquear si el envío está en un estado distinto al
+    // normal de despacho (ready_to_ship / handling). Sirve para quedarse
+    // tranquilo de que todo lo demás está bien.
+    const NORMALES = ['ready_to_ship', 'handling', 'pending'];
     let aviso = '';
-    if (shipStatus === 'shipped')   aviso = 'Ojo: ML ya la marca en camino.';
-    if (shipStatus === 'delivered') aviso = 'Ojo: ML ya la marca entregada.';
-    console.log(`[DESPACHAR] OK ship=${s.shipment_id} venta=${s.nro_venta} tipo=${tipo}`);
-    res.json({ resultado: 'ok', mensaje: 'Despachada', aviso, ...base });
+    if (shipStatus === 'shipped')        aviso = 'Ojo: ML ya la marca EN CAMINO (quizás ya cerró la colecta).';
+    else if (shipStatus === 'delivered') aviso = 'Ojo: ML ya la marca ENTREGADA.';
+    else if (shipStatus === 'not_delivered') aviso = 'Ojo: ML la marca NO ENTREGADA.';
+    else if (shipStatus && !NORMALES.includes(shipStatus))
+      aviso = `Ojo: estado inusual en ML (${shipStatus}${shipSub ? '/' + shipSub : ''}). Revisá antes de despachar.`;
+    console.log(`[DESPACHAR] OK ship=${s.shipment_id} venta=${s.nro_venta} tipo=${tipo} status=${shipStatus}/${shipSub}`);
+    res.json({ resultado: aviso ? 'ok_aviso' : 'ok', mensaje: 'Despachada', aviso, estado_ml: shipStatus, ...base });
   } catch (e) { console.error('[DESPACHAR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
@@ -1465,7 +1519,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '4.1.3-diag-colectas' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '4.2-verificacion' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

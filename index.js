@@ -1397,25 +1397,31 @@ app.get('/api/despacho/diag-fechas', async (req, res) => {
 
     const hoy = fechaHoyART();
     const detalle = [];
+    let crudo_primero = null;
     for (const e of (envios || [])) {
       try {
         const ship = await (await fetch(`https://api.mercadolibre.com/shipments/${e.shipment_id}`,
           { headers: { Authorization: `Bearer ${token}` } })).json();
         const so = ship.shipping_option || {};
+        // Del primer envío, guardamos el shipping_option COMPLETO y las claves del ship
+        if (!crudo_primero) crudo_primero = {
+          shipment_id: e.shipment_id,
+          claves_ship: Object.keys(ship),
+          shipping_option_completo: so,
+          lead_time: ship.lead_time || null
+        };
         detalle.push({
           shipment_id: e.shipment_id, nro_venta: e.nro_venta, sku: e.sku, tipo: e.tipo,
           status: ship.status, substatus: ship.substatus,
           guardado_en_foto: e.limite,
-          // Todos los candidatos de fecha que suele traer ML:
           handling_limit_date: (so.estimated_handling_limit && so.estimated_handling_limit.date) || null,
           estimated_delivery_limit: (so.estimated_delivery_limit && so.estimated_delivery_limit.date) || null,
-          estimated_delivery_time: (so.estimated_delivery_time && so.estimated_delivery_time.date) || null,
           estimated_schedule_limit: (so.estimated_schedule_limit && so.estimated_schedule_limit.date) || null,
           date_created: ship.date_created || null
         });
       } catch (err) { detalle.push({ shipment_id: e.shipment_id, error: err.message }); }
     }
-    res.json({ hoy_art: hoy, cantidad: detalle.length, envios: detalle });
+    res.json({ hoy_art: hoy, cantidad: detalle.length, envios: detalle, crudo_primero });
   } catch (e) { console.error('[DIAG-FECHAS]', e.message); res.status(500).json({ error: e.message }); }
 });
 
@@ -1561,7 +1567,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '4.2.1-diag-fechas' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '4.2.2-diag-fechas' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

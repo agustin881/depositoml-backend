@@ -103,7 +103,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function requireAuth(req, res, next) {
   try {
     // Excepción temporal: diagnóstico accesible con clave en la URL (para debug)
-    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas' || req.path === '/diag-fechas') && (req.query.clave || '') === 'pontec2026') return next();
+    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas' || req.path === '/diag-fechas' || req.path === '/diag-nodo') && (req.query.clave || '') === 'pontec2026') return next();
     const h = req.headers.authorization || '';
     const token = h.startsWith('Bearer ') ? h.slice(7) : '';
     if (!token) return res.status(401).json({ error: 'No autorizado' });
@@ -983,6 +983,64 @@ app.get('/api/despacho/colectas', async (_req, res) => {
   } catch (e) { console.error('[COLECTAS]', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// ── DIAGNÓSTICO: ¿multi-origen? ¿qué nodo trae el transportista/patente? ──
+// /api/despacho/diag-nodo  (app logueada)  ó  ?clave=pontec2026 (navegador)
+app.get('/api/despacho/diag-nodo', async (_req, res) => {
+  try {
+    const token = await getValidToken(ML_USER_ID);
+    if (!token) throw new Error('No hay token de ML disponible');
+    const auth = { headers: { Authorization: `Bearer ${token}` } };
+    const dia = diaSemanaHoyART();
+
+    // 1) ¿la cuenta es multi-origen? (tag warehouse_management en /users)
+    let tags = [], multiOrigen = false;
+    try {
+      const u = await (await fetch(`https://api.mercadolibre.com/users/${ML_USER_ID}`, auth)).json();
+      tags = u.tags || [];
+      multiOrigen = tags.includes('warehouse_management');
+    } catch (e) { /* sigue */ }
+
+    // 2) depósitos/nodos del vendedor
+    let nodos = [];
+    try {
+      const r = await fetch(`https://api.mercadolibre.com/users/${ML_USER_ID}/stores/search?tags=stock_location`, auth);
+      const s = await r.json();
+      nodos = (s.results || []).map(x => ({
+        store_id: x.id != null ? String(x.id) : '',
+        network_node_id: x.network_node_id != null ? String(x.network_node_id) : '',
+        descripcion: x.description || '',
+        direccion: x.location ? `${x.location.address_line || ''} ${x.location.city || ''}`.trim() : ''
+      }));
+    } catch (e) { /* sigue */ }
+
+    // 3) probar el schedule por cada id candidato (usuario + nodo + store) y extraer HOY
+    const candidatos = [{ etiqueta: 'user_id', id: String(ML_USER_ID) }];
+    for (const n of nodos) {
+      if (n.network_node_id) candidatos.push({ etiqueta: 'node · ' + (n.descripcion || n.network_node_id), id: n.network_node_id });
+      if (n.store_id)        candidatos.push({ etiqueta: 'store · ' + (n.descripcion || n.store_id), id: n.store_id });
+    }
+    const probados = [];
+    for (const c of candidatos) {
+      try {
+        const r = await fetch(`https://api.mercadolibre.com/users/${c.id}/shipping/schedule/cross_docking`, auth);
+        let data = {}; try { data = await r.json(); } catch (_) {}
+        const hoy = data && data.schedule && data.schedule[dia];
+        const detalle = (hoy && Array.isArray(hoy.detail)) ? hoy.detail.map(d => ({
+          from: d.from || '', to: d.to || '', cutoff: d.cutoff || '',
+          carrier: (d.carrier && d.carrier.name) || '',
+          patente: (d.vehicle && d.vehicle.license_plate) || '',
+          vehiculo: (d.vehicle && d.vehicle.vehicle_type) || '',
+          chofer: (d.driver && d.driver.name) || ''
+        })) : [];
+        probados.push({ ...c, status: r.status, ventanas_hoy: detalle.length, detalle });
+      } catch (e) { probados.push({ ...c, error: e.message }); }
+      await sleep(150);
+    }
+
+    res.json({ dia, multi_origen: multiOrigen, tags, nodos, probados });
+  } catch (e) { console.error('[DIAG-NODO]', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // ── Endpoint: buscar una venta por número (estado en ML + lo nuestro) ──
 app.get('/api/despacho/buscar', async (req, res) => {
   try {
@@ -1756,7 +1814,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.1-colectas' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.2-diagnodo' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

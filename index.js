@@ -1357,7 +1357,7 @@ app.get('/api/despacho/destinos', async (_req, res) => {
     res.json({
       fecha,
       abiertos,
-      max_abiertos: 2,
+      max_abiertos: 4,
       colectas: colectas.map(c => ({ horario: `${c.from}-${c.to}`, cutoff: c.cutoff, carrier: c.carrier })),
       transportistas: TRANSPORTISTAS_FLEX
     });
@@ -1375,13 +1375,12 @@ app.post('/api/despacho/destinos/abrir', async (req, res) => {
     // Tope de 2 abiertos a la vez
     const { data: ab } = await supabase.from('dep_destinos')
       .select('id,nombre,tipo,transportista,colecta_horario').eq('fecha', fecha).eq('abierto', true);
-    if ((ab || []).length >= 2)
-      return res.status(409).json({ error: 'Ya hay 2 destinos abiertos. Cerrá uno para abrir otro.' });
+    if ((ab || []).length >= 4)
+      return res.status(409).json({ error: 'Ya hay 4 destinos abiertos. Cerrá uno para abrir otro.' });
 
     let row = { fecha, tipo, abierto: true, abierto_por: (req.authUser && req.authUser.email) || null };
 
     if (tipo === 'colecta') {
-      const horario = ((req.body && req.body.colecta_horario) || '').trim();
       const camionId = (req.body && req.body.camion_id) || null;
       let patente = '', descripcion = '';
       if (camionId) {
@@ -1389,11 +1388,12 @@ app.post('/api/despacho/destinos/abrir', async (req, res) => {
           .select('patente,descripcion').eq('id', camionId).limit(1);
         if (cam && cam[0]) { patente = cam[0].patente || ''; descripcion = cam[0].descripcion || ''; }
       }
-      // Evitar duplicar el mismo horario abierto
-      const yaAbierta = (ab || []).find(d => d.tipo === 'colecta' && d.colecta_horario === horario);
-      if (yaAbierta) return res.json({ destino: yaAbierta, existia: true });
-      row.nombre = horario ? `Colecta ${horario}` : 'Colecta';
-      row.colecta_horario = horario;
+      // Numerar: Colecta 1, Colecta 2, … (según las creadas hoy, abiertas o cerradas)
+      const { data: colsHoy } = await supabase.from('dep_destinos')
+        .select('id').eq('fecha', fecha).eq('tipo', 'colecta');
+      const n = (colsHoy || []).length + 1;
+      row.nombre = `Colecta ${n}`;
+      row.colecta_horario = '';
       row.camion_id = camionId;
       row.patente = patente;
       row.descripcion = descripcion;
@@ -1756,7 +1756,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.0-despachar' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.1-colectas' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

@@ -94,7 +94,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function requireAuth(req, res, next) {
   try {
     // Excepción temporal: diagnóstico accesible con clave en la URL (para debug)
-    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas') && (req.query.clave || '') === 'pontec2026') return next();
+    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas' || req.path === '/diag-fechas') && (req.query.clave || '') === 'pontec2026') return next();
     const h = req.headers.authorization || '';
     const token = h.startsWith('Bearer ') ? h.slice(7) : '';
     if (!token) return res.status(401).json({ error: 'No autorizado' });
@@ -1377,6 +1377,48 @@ app.post('/api/despacho/demo/limpiar', async (_req, res) => {
   } catch (e) { console.error('[DEMO]', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// ── DIAGNÓSTICO de FECHAS LÍMITE de despacho ──────────────────────
+// Toma envíos imprimibles y muestra todos los campos de fecha de ML,
+// para confirmar cuál es el "Despachar: X" real de la etiqueta.
+// /api/despacho/diag-fechas?clave=pontec2026
+app.get('/api/despacho/diag-fechas', async (req, res) => {
+  if ((req.query.clave || '') !== 'pontec2026')
+    return res.status(401).json({ error: 'Agregá ?clave=pontec2026' });
+  try {
+    const token = await getValidToken(ML_USER_ID);
+    if (!token) throw new Error('No hay token de ML disponible');
+
+    // Tomar algunos envíos nuestros desde la foto (los más recientes)
+    const { data: envios } = await supabase.from('dep_envios')
+      .select('shipment_id,nro_venta,sku,tipo,status,limite')
+      .eq('es_nuestro', true).neq('tipo', 'full')
+      .in('status', ['ready_to_ship', 'pending', 'handling'])
+      .limit(8);
+
+    const hoy = fechaHoyART();
+    const detalle = [];
+    for (const e of (envios || [])) {
+      try {
+        const ship = await (await fetch(`https://api.mercadolibre.com/shipments/${e.shipment_id}`,
+          { headers: { Authorization: `Bearer ${token}` } })).json();
+        const so = ship.shipping_option || {};
+        detalle.push({
+          shipment_id: e.shipment_id, nro_venta: e.nro_venta, sku: e.sku, tipo: e.tipo,
+          status: ship.status, substatus: ship.substatus,
+          guardado_en_foto: e.limite,
+          // Todos los candidatos de fecha que suele traer ML:
+          handling_limit_date: (so.estimated_handling_limit && so.estimated_handling_limit.date) || null,
+          estimated_delivery_limit: (so.estimated_delivery_limit && so.estimated_delivery_limit.date) || null,
+          estimated_delivery_time: (so.estimated_delivery_time && so.estimated_delivery_time.date) || null,
+          estimated_schedule_limit: (so.estimated_schedule_limit && so.estimated_schedule_limit.date) || null,
+          date_created: ship.date_created || null
+        });
+      } catch (err) { detalle.push({ shipment_id: e.shipment_id, error: err.message }); }
+    }
+    res.json({ hoy_art: hoy, cantidad: detalle.length, envios: detalle });
+  } catch (e) { console.error('[DIAG-FECHAS]', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // ── Endpoint: DIAGNÓSTICO (qué llega de ML y dónde se pierde) ──────
 // No filtra: cuenta envíos por estado, por logística y por depósito.
 // Sirve para entender por qué "no trae nada".
@@ -1519,7 +1561,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '4.2-verificacion' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '4.2.1-diag-fechas' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

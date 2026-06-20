@@ -1,8 +1,12 @@
 // ============================================================
-//  DEPÓSITO · BACKEND  v3.0
+//  DEPÓSITO · BACKEND  v5.0
 //  Fase 1: impresión por SKU + registro + reimpresión + conteo
 //  Fase 2: verificación de despacho (escaneo + chequeo de cancelación),
 //  seguimiento por etapas, código del día y colectas del día
+//  Parte 2 (v5.0): centro de despacho — base de camiones, destinos
+//  (Colecta con camión / Flex con transportista), abrir/cerrar destino,
+//  escaneo que carga al destino con validación Flex↔Colecta, y detalle
+//  de pagos a transportistas tercerizados (Ruedo/Gustavo).
 //  App separada de MargenML. Comparte la base Supabase
 //  (token de ML en ml_tokens) y usa tablas propias dep_*.
 // ============================================================
@@ -87,6 +91,11 @@ const ESTADO_ES = {
 // Si la variable está vacía, deja entrar a cualquier usuario logueado.
 const EMAILS_DEPOSITO = (process.env.EMAILS_DEPOSITO || '')
   .toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
+
+// Transportistas Flex tercerizados (no son camiones, no tienen patente).
+// Se les ENTREGAN los paquetes. Configurable en Railway con FLEX_TRANSPORTISTAS.
+const TRANSPORTISTAS_FLEX = (process.env.FLEX_TRANSPORTISTAS || 'Ruedo,Gustavo')
+  .split(',').map(s => s.trim()).filter(Boolean);
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -1121,6 +1130,15 @@ app.post('/api/despacho/despachar', async (req, res) => {
     const token = await getValidToken(ML_USER_ID);
     if (!token) throw new Error('No hay token de ML disponible');
 
+    // Destino abierto al que se está cargando (Parte 2). Opcional: si no
+    // viene, se registra igual sin vínculo (compatibilidad).
+    const destinoId = (req.body && req.body.destino_id) || null;
+    let destino = null;
+    if (destinoId) {
+      const { data: dd2 } = await supabase.from('dep_destinos').select('*').eq('id', destinoId).limit(1);
+      destino = (dd2 && dd2[0]) || null;
+    }
+
     // ── Rama DEMO: si la venta/envío es de prueba, resolvemos local ──
     const numsDemo = extraerNumeros(codigo);
     const ventaDemo = numsDemo.find(n => n.startsWith('2000099000'));
@@ -1133,6 +1151,11 @@ app.post('/api/despacho/despachar', async (req, res) => {
       const base = { shipment_id: dv.shipment_id, nro_venta: dv.nro_venta, sku: dv.sku, titulo: dv.titulo, tipo: dv.tipo, demo: true };
       if (dv.status === 'cancelled')
         return res.json({ resultado: 'cancelada', mensaje: 'NO DESPACHAR · la venta está CANCELADA', ...base });
+      // Validación Flex↔Colecta contra el destino abierto
+      if (destino && destino.tipo && dv.tipo && destino.tipo !== dv.tipo)
+        return res.json({ resultado: 'tipo_incorrecto', esperado: destino.tipo, recibido: dv.tipo,
+          mensaje: `Este paquete es ${dv.tipo.toUpperCase()} y el destino abierto es ${destino.tipo.toUpperCase()}`,
+          destino_nombre: destino.nombre, ...base });
       const { data: dup } = await supabase.from('dep_despachos')
         .select('despachado_at,usuario').eq('shipment_id', dv.shipment_id)
         .order('despachado_at', { ascending: false }).limit(1);
@@ -1141,14 +1164,18 @@ app.post('/api/despacho/despachar', async (req, res) => {
           despachado_at: dup[0].despachado_at, usuario: dup[0].usuario || '', ...base });
       const { error } = await supabase.from('dep_despachos').insert({
         shipment_id: dv.shipment_id, nro_venta: dv.nro_venta, sku: dv.sku, titulo: dv.titulo,
-        tipo: dv.tipo, usuario: (req.authUser && req.authUser.email) || 'demo'
+        tipo: dv.tipo, usuario: (req.authUser && req.authUser.email) || 'demo',
+        destino_id: destino ? destino.id : null,
+        destino_nombre: destino ? destino.nombre : null,
+        transportista: destino ? (destino.transportista || null) : null
       });
       if (error) throw new Error(error.message);
       let aviso = '';
       if (dv.status === 'shipped')   aviso = 'Ojo: ML ya la marca en camino.';
       if (dv.status === 'delivered') aviso = 'Ojo: ML ya la marca entregada.';
       console.log(`[DESPACHAR][DEMO] OK ship=${dv.shipment_id} venta=${dv.nro_venta}`);
-      return res.json({ resultado: 'ok', mensaje: 'Despachada (demo)', aviso, ...base });
+      return res.json({ resultado: 'ok', mensaje: 'Despachada (demo)', aviso,
+        destino_nombre: destino ? destino.nombre : null, ...base });
     }
 
     const s = await resolverEscaneo(codigo, token);
@@ -1185,6 +1212,15 @@ app.post('/api/despacho/despachar', async (req, res) => {
       return res.json({ resultado: 'cancelada', mensaje: 'NO DESPACHAR · la venta está CANCELADA', ...base });
     }
 
+    // Validación Flex↔Colecta: no dejar cargar un paquete del tipo equivocado
+    // al destino abierto. Solo si conocemos el tipo del paquete.
+    if (destino && destino.tipo && tipo && destino.tipo !== tipo) {
+      console.log(`[DESPACHAR] TIPO INCORRECTO ship=${s.shipment_id} paquete=${tipo} destino=${destino.tipo}`);
+      return res.json({ resultado: 'tipo_incorrecto', esperado: destino.tipo, recibido: tipo,
+        mensaje: `Este paquete es ${tipo.toUpperCase()} y el destino abierto es ${destino.tipo.toUpperCase()}`,
+        destino_nombre: destino.nombre, ...base });
+    }
+
     // ¿Ya se había escaneado?
     const { data: dup } = await supabase.from('dep_despachos')
       .select('despachado_at,usuario').eq('shipment_id', s.shipment_id)
@@ -1207,7 +1243,10 @@ app.post('/api/despacho/despachar', async (req, res) => {
       usuario: (req.authUser && req.authUser.email) || null,
       colecta_carrier: col ? (col.carrier || null) : null,
       colecta_patente: col ? (col.patente || null) : null,
-      colecta_horario: col ? `${col.from}-${col.to}` : null
+      colecta_horario: col ? `${col.from}-${col.to}` : null,
+      destino_id: destino ? destino.id : null,
+      destino_nombre: destino ? destino.nombre : null,
+      transportista: destino ? (destino.transportista || null) : null
     });
     if (error) throw new Error(error.message);
 
@@ -1223,7 +1262,8 @@ app.post('/api/despacho/despachar', async (req, res) => {
     else if (shipStatus && !NORMALES.includes(shipStatus))
       aviso = `Ojo: estado inusual en ML (${shipStatus}${shipSub ? '/' + shipSub : ''}). Revisá antes de despachar.`;
     console.log(`[DESPACHAR] OK ship=${s.shipment_id} venta=${s.nro_venta} tipo=${tipo} status=${shipStatus}/${shipSub}`);
-    res.json({ resultado: aviso ? 'ok_aviso' : 'ok', mensaje: 'Despachada', aviso, estado_ml: shipStatus, ...base });
+    res.json({ resultado: aviso ? 'ok_aviso' : 'ok', mensaje: 'Despachada', aviso, estado_ml: shipStatus,
+      destino_nombre: destino ? destino.nombre : null, ...base });
   } catch (e) { console.error('[DESPACHAR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
@@ -1256,6 +1296,155 @@ app.get('/api/despacho/despachados', async (_req, res) => {
       despachadas: desp || []
     });
   } catch (e) { console.error('[DESPACHADOS]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// ════════════════════════════════════════════════════════════════
+//  PARTE 2 · CENTRO DE DESPACHO: camiones, destinos y asignación
+// ════════════════════════════════════════════════════════════════
+
+// ── Base de camiones (para Colecta de ML) ─────────────────────────
+app.get('/api/despacho/camiones', async (_req, res) => {
+  try {
+    const { data, error } = await supabase.from('dep_camiones')
+      .select('id,patente,descripcion,activo').eq('activo', true)
+      .order('patente', { ascending: true });
+    if (error) throw new Error(error.message);
+    res.json({ camiones: data || [] });
+  } catch (e) { console.error('[CAMIONES]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/despacho/camiones', async (req, res) => {
+  try {
+    const patente = ((req.body && req.body.patente) || '').trim().toUpperCase();
+    const descripcion = ((req.body && req.body.descripcion) || '').trim();
+    if (!patente) return res.status(400).json({ error: 'Falta la patente' });
+    // ¿ya existe esa patente activa? la reusamos
+    const { data: ex } = await supabase.from('dep_camiones')
+      .select('id,patente,descripcion,activo').eq('patente', patente).eq('activo', true).limit(1);
+    if (ex && ex[0]) return res.json({ camion: ex[0], existia: true });
+    const { data, error } = await supabase.from('dep_camiones')
+      .insert({ patente, descripcion, activo: true })
+      .select('id,patente,descripcion,activo').limit(1);
+    if (error) throw new Error(error.message);
+    res.json({ camion: (data && data[0]) || null });
+  } catch (e) { console.error('[CAMIONES]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// ── Destinos del día: abiertos + opciones para abrir ──────────────
+app.get('/api/despacho/destinos', async (_req, res) => {
+  try {
+    const fecha = fechaHoyART();
+    const { data: dest } = await supabase.from('dep_destinos')
+      .select('*').eq('fecha', fecha).eq('abierto', true)
+      .order('abierto_at', { ascending: true });
+
+    // Conteo de paquetes cargados hoy a cada destino
+    const { data: desp } = await supabase.from('dep_despachos')
+      .select('destino_id,tipo').gte('despachado_at', inicioDeHoyART());
+    const conteo = {};
+    for (const d of (desp || [])) {
+      if (d.destino_id != null) conteo[d.destino_id] = (conteo[d.destino_id] || 0) + 1;
+    }
+    const abiertos = (dest || []).map(d => ({ ...d, cargados: conteo[d.id] || 0 }));
+
+    // Opciones de Colecta de ML (horarios del día)
+    let colectas = [];
+    try {
+      const token = await getValidToken(ML_USER_ID);
+      if (token) colectas = (await colectasDelDia(token)).filter(c => c.tanda === 'colecta');
+    } catch (e) { /* sin colectas */ }
+
+    res.json({
+      fecha,
+      abiertos,
+      max_abiertos: 2,
+      colectas: colectas.map(c => ({ horario: `${c.from}-${c.to}`, cutoff: c.cutoff, carrier: c.carrier })),
+      transportistas: TRANSPORTISTAS_FLEX
+    });
+  } catch (e) { console.error('[DESTINOS]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// ── Abrir un destino (Colecta con camión, o Flex con transportista) ─
+app.post('/api/despacho/destinos/abrir', async (req, res) => {
+  try {
+    const fecha = fechaHoyART();
+    const tipo = ((req.body && req.body.tipo) || '').trim();   // 'colecta' | 'flex'
+    if (!['colecta', 'flex'].includes(tipo))
+      return res.status(400).json({ error: 'Tipo inválido (colecta o flex)' });
+
+    // Tope de 2 abiertos a la vez
+    const { data: ab } = await supabase.from('dep_destinos')
+      .select('id,nombre,tipo,transportista,colecta_horario').eq('fecha', fecha).eq('abierto', true);
+    if ((ab || []).length >= 2)
+      return res.status(409).json({ error: 'Ya hay 2 destinos abiertos. Cerrá uno para abrir otro.' });
+
+    let row = { fecha, tipo, abierto: true, abierto_por: (req.authUser && req.authUser.email) || null };
+
+    if (tipo === 'colecta') {
+      const horario = ((req.body && req.body.colecta_horario) || '').trim();
+      const camionId = (req.body && req.body.camion_id) || null;
+      let patente = '', descripcion = '';
+      if (camionId) {
+        const { data: cam } = await supabase.from('dep_camiones')
+          .select('patente,descripcion').eq('id', camionId).limit(1);
+        if (cam && cam[0]) { patente = cam[0].patente || ''; descripcion = cam[0].descripcion || ''; }
+      }
+      // Evitar duplicar el mismo horario abierto
+      const yaAbierta = (ab || []).find(d => d.tipo === 'colecta' && d.colecta_horario === horario);
+      if (yaAbierta) return res.json({ destino: yaAbierta, existia: true });
+      row.nombre = horario ? `Colecta ${horario}` : 'Colecta';
+      row.colecta_horario = horario;
+      row.camion_id = camionId;
+      row.patente = patente;
+      row.descripcion = descripcion;
+    } else {
+      const transportista = ((req.body && req.body.transportista) || '').trim();
+      if (!transportista) return res.status(400).json({ error: 'Elegí el transportista (ej. Ruedo o Gustavo)' });
+      const yaAbierto = (ab || []).find(d => d.tipo === 'flex' && (d.transportista || '') === transportista);
+      if (yaAbierto) return res.json({ destino: yaAbierto, existia: true });
+      row.nombre = transportista;
+      row.transportista = transportista;
+    }
+
+    const { data, error } = await supabase.from('dep_destinos').insert(row).select('*').limit(1);
+    if (error) throw new Error(error.message);
+    res.json({ destino: (data && data[0]) || null });
+  } catch (e) { console.error('[DESTINO-ABRIR]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// ── Cerrar un destino ─────────────────────────────────────────────
+app.post('/api/despacho/destinos/cerrar', async (req, res) => {
+  try {
+    const id = (req.body && req.body.destino_id) || null;
+    if (!id) return res.status(400).json({ error: 'Falta el destino' });
+    const { error } = await supabase.from('dep_destinos')
+      .update({ abierto: false, cerrado_at: new Date().toISOString() }).eq('id', id);
+    if (error) throw new Error(error.message);
+    res.json({ ok: true });
+  } catch (e) { console.error('[DESTINO-CERRAR]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// ── Detalle para pagar a transportistas Flex (Ruedo/Gustavo) ──────
+// /api/despacho/pagos-transportista?desde=YYYY-MM-DD&hasta=YYYY-MM-DD
+app.get('/api/despacho/pagos-transportista', async (req, res) => {
+  try {
+    const hoy = fechaHoyART();
+    const desde = (req.query.desde || hoy.substring(0, 8) + '01') + 'T00:00:00.000-03:00';
+    const hasta = (req.query.hasta || hoy) + 'T23:59:59.999-03:00';
+    const { data, error } = await supabase.from('dep_despachos')
+      .select('shipment_id,nro_venta,sku,titulo,transportista,despachado_at')
+      .not('transportista', 'is', null)
+      .gte('despachado_at', desde).lte('despachado_at', hasta)
+      .order('despachado_at', { ascending: true });
+    if (error) throw new Error(error.message);
+    const porTransportista = {};
+    for (const d of (data || [])) {
+      const t = d.transportista || 'Sin transportista';
+      (porTransportista[t] = porTransportista[t] || []).push(d);
+    }
+    const resumen = Object.keys(porTransportista).map(t => ({ transportista: t, cantidad: porTransportista[t].length }));
+    res.json({ desde, hasta, total: (data || []).length, resumen, detalle: porTransportista });
+  } catch (e) { console.error('[PAGOS]', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // ── Endpoint: SEGUIMIENTO (flujo completo por etiqueta) ───────────
@@ -1567,7 +1756,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '4.2.2-diag-fechas' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.0-despachar' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

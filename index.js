@@ -1346,10 +1346,19 @@ app.get('/api/despacho/despachados', async (_req, res) => {
       .filter(r => !despIds.has(r.shipment_id))
       .sort(ordenarPorSku);
 
+    // Desglose por tipo (Colecta / Flex): impresas, escaneadas y pendientes
+    const porTipo = { flex: { impresas: 0, escaneadas: 0 }, colecta: { impresas: 0, escaneadas: 0 } };
+    for (const r of impUnicas.values()) { if (porTipo[r.tipo]) porTipo[r.tipo].impresas++; }
+    const despUnicas = new Map();
+    for (const r of (desp || [])) if (!despUnicas.has(r.shipment_id)) despUnicas.set(r.shipment_id, r);
+    for (const r of despUnicas.values()) { if (porTipo[r.tipo]) porTipo[r.tipo].escaneadas++; }
+    for (const t of ['flex', 'colecta']) porTipo[t].pendientes = Math.max(0, porTipo[t].impresas - porTipo[t].escaneadas);
+
     res.json({
       impresas_hoy: impUnicas.size,
       despachadas_hoy: despIds.size,
       faltan_cnt: faltan.length,
+      por_tipo: porTipo,
       faltan,
       despachadas: desp || []
     });
@@ -1814,7 +1823,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.2-diagnodo' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.3-contador' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

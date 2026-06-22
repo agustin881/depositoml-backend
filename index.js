@@ -751,6 +751,74 @@ app.get('/api/despacho/panel', async (_req, res) => {
   } catch (e) { console.error('[PANEL]', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// ── SEPARAR: ventas de Colecta con 2+ unidades que se pueden dividir ──
+app.get('/api/despacho/separables', async (_req, res) => {
+  try {
+    const { data: imp } = await supabase.from('dep_impresiones').select('shipment_id');
+    const impSet = new Set((imp || []).map(r => r.shipment_id));
+    const { data: desp } = await supabase.from('dep_despachos').select('shipment_id');
+    const despSet = new Set((desp || []).map(r => r.shipment_id));
+
+    let envios = [], from = 0;
+    while (true) {
+      const { data, error } = await supabase.from('dep_envios')
+        .select('shipment_id,nro_venta,sku,titulo,unidades,tipo,status,cancelada')
+        .eq('es_nuestro', true).eq('tipo', 'colecta').gte('unidades', 2)
+        .range(from, from + 999);
+      if (error) throw new Error(error.message);
+      if (!data || !data.length) break;
+      envios = envios.concat(data);
+      if (data.length < 1000) break;
+      from += 1000;
+    }
+    const TERMINADOS = ['shipped', 'delivered', 'not_delivered', 'returned', 'cancelled'];
+    const lista = [];
+    for (const s of envios) {
+      if (s.cancelada || TERMINADOS.includes(s.status)) continue; // ya no aplica
+      if (despSet.has(s.shipment_id)) continue;                   // ya despachada
+      lista.push({
+        shipment_id: s.shipment_id, nro_venta: s.nro_venta, sku: s.sku, titulo: s.titulo,
+        unidades: s.unidades || 2, impresa: impSet.has(s.shipment_id)
+      });
+    }
+    lista.sort(ordenarPorSku);
+    res.json({ cantidad: lista.length, separables: lista });
+  } catch (e) { console.error('[SEPARABLES]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Dispara el split en ML: separa 1 unidad en su propia caja (2 uds → 1 + 1).
+app.post('/api/despacho/separar', async (req, res) => {
+  try {
+    const shipmentId = (req.body && req.body.shipment_id) || null;
+    const nroVenta = (req.body && req.body.nro_venta) || null;
+    const unidades = parseInt((req.body && req.body.unidades) || 0, 10);
+    if (!shipmentId || !nroVenta) return res.status(400).json({ error: 'Faltan datos del envío' });
+    if (!unidades || unidades < 2) return res.status(400).json({ error: 'La venta no tiene 2 o más unidades' });
+    const token = await getValidToken(ML_USER_ID);
+    if (!token) throw new Error('No hay token de ML');
+    // ML solo deja separar en 2 cajas por vez: 1 unidad va sola, el resto en la otra caja.
+    const body = {
+      reason: 'OTHER_MOTIVE',
+      packs: [
+        { orders: [{ id: String(nroVenta), quantity: 1 }] },
+        { orders: [{ id: String(nroVenta), quantity: unidades - 1 }] }
+      ]
+    };
+    const r = await fetch(`https://api.mercadolibre.com/shipments/${shipmentId}/split`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'x-format-new': 'true' },
+      body: JSON.stringify(body)
+    });
+    const txt = await r.text();
+    if (!r.ok) {
+      console.error('[SEPARAR] ML', r.status, txt);
+      return res.status(400).json({ error: `ML respondió ${r.status}: ${(txt || '').substring(0, 300)}` });
+    }
+    console.log(`[SEPARAR] OK ship=${shipmentId} venta=${nroVenta} (${unidades}u → 1 + ${unidades - 1})`);
+    res.json({ ok: true, separado_en: unidades === 2 ? '1 + 1' : `1 + ${unidades - 1}` });
+  } catch (e) { console.error('[SEPARAR]', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // ── Endpoints: impresión ──────────────────────────────────────────
 app.get('/api/despacho/pendientes', async (req, res) => {
   try {
@@ -1823,7 +1891,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.3-contador' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.4-separar' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

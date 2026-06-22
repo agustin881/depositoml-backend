@@ -922,6 +922,10 @@ async function mlSepararEnvio(token, shipmentId, nroVenta, unidades) {
     console.error('[SEPARAR] ML', r.status, txt);
     throw new Error(`ML respondió ${r.status}: ${(txt || '').substring(0, 200)}`);
   }
+  // Marcar el envío original como separado en la foto local, así desaparece de
+  // la lista al instante sin esperar el webhook de ML (ML cancela el original).
+  try { await supabase.from('dep_envios').update({ cancelada: true }).eq('shipment_id', String(shipmentId)); }
+  catch (e) { console.error('[SEPARAR] no se pudo marcar la foto:', e.message); }
   return unidades === 2 ? '1 + 1' : `1 + ${unidades - 1}`;
 }
 
@@ -1766,8 +1770,8 @@ app.get('/api/despacho/seguimiento', async (_req, res) => {
       else if (s.status === 'cancelled')                    continue; // canceladas sin despachar: afuera
       else if (desMap.has(s.shipment_id))                   b.despachadas.push(fila);
       else if (impSet.has(s.shipment_id))                   b.en_preparacion.push(fila);
-      else if (!imprimible(s) && esFuturo(s))               b.programados.push(fila);
-      else                                                  b.para_imprimir.push(fila);
+      else if (imprimible(s))                               b.para_imprimir.push(fila);
+      else                                                  b.programados.push(fila); // futura o "en procesamiento": todavía no está lista para imprimir
     }
     for (const k of Object.keys(b)) b[k].sort(ordenarPorSku);
 
@@ -2032,7 +2036,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.7-diagimprimir' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.9-seguimiento-fix' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

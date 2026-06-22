@@ -152,6 +152,68 @@ async function getValidToken(userId) {
   return data.access_token;
 }
 
+// ── Reconectar Mercado Libre (genera un token NUEVO con escritura) ──
+// Estas rutas NO van detrás de requireAuth (son redirecciones del navegador).
+const OAUTH_REDIRECT = process.env.OAUTH_REDIRECT_URI ||
+  'https://depositoml-backend-production.up.railway.app/api/oauth/callback';
+
+app.get('/api/oauth/login', (req, res) => {
+  if ((req.query.clave || '') !== 'pontec2026') return res.status(403).send('Falta la clave.');
+  const url = 'https://auth.mercadolibre.com.ar/authorization'
+    + '?response_type=code'
+    + '&client_id=' + encodeURIComponent(ML_CLIENT_ID)
+    + '&redirect_uri=' + encodeURIComponent(OAUTH_REDIRECT);
+  res.redirect(url);
+});
+
+app.get('/api/oauth/callback', async (req, res) => {
+  try {
+    if (req.query.error) {
+      return res.status(400).send(`<h2>No se pudo reconectar</h2><p>${req.query.error_description || req.query.error}</p>`);
+    }
+    const code = req.query.code;
+    if (!code) return res.status(400).send('<h2>No llegó el código de Mercado Libre.</h2>');
+
+    const resp = await fetch('https://api.mercadolibre.com/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        client_id: ML_CLIENT_ID,
+        client_secret: ML_CLIENT_SECRET,
+        code: String(code),
+        redirect_uri: OAUTH_REDIRECT
+      })
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.access_token) {
+      console.error('[OAUTH] error', resp.status, JSON.stringify(data));
+      return res.status(400).send(`<h2>No se pudo reconectar</h2><pre>${JSON.stringify(data, null, 2)}</pre>`);
+    }
+
+    const uid = String(data.user_id || ML_USER_ID);
+    await supabase.from('ml_tokens').upsert({
+      user_id: uid,
+      access_token: data.access_token,
+      refresh_token: data.refresh_token,
+      expires_at: new Date(Date.now() + (data.expires_in || 21600) * 1000).toISOString(),
+      updated_at: new Date().toISOString()
+    }, { onConflict: 'user_id' });
+    console.log(`[OAUTH] reconectado user=${uid} scope=${data.scope || '(sin scope informado)'}`);
+
+    res.send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+      <body style="font-family:system-ui,sans-serif;text-align:center;padding:48px 24px;color:#333">
+        <div style="font-size:54px">✅</div>
+        <h2 style="color:#00A650;margin:8px 0">Mercado Libre reconectado</h2>
+        <p style="color:#666">Permisos otorgados: <b>${data.scope || '(revisá en la app)'}</b></p>
+        <p>Ya podés cerrar esta pestaña y volver a la app a probar <b>"Separar"</b>.</p>
+      </body></html>`);
+  } catch (e) {
+    console.error('[OAUTH]', e.message);
+    res.status(500).send(`<h2>Error</h2><p>${e.message}</p>`);
+  }
+});
+
 // ── Helper: tareas con concurrencia limitada (mantiene el orden) ──
 async function poolMap(items, limit, fn) {
   const results = new Array(items.length);
@@ -1891,7 +1953,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.4-separar' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.5-reconectar' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

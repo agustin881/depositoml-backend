@@ -849,6 +849,29 @@ app.get('/api/despacho/separables', async (_req, res) => {
 });
 
 // Dispara el split en ML: separa 1 unidad en su propia caja (2 uds → 1 + 1).
+// Helper: dispara el split de un envío en ML. Devuelve el reparto o tira error.
+async function mlSepararEnvio(token, shipmentId, nroVenta, unidades) {
+  // ML solo deja separar en 2 cajas por vez: 1 unidad va sola, el resto en la otra caja.
+  const body = {
+    reason: 'OTHER_MOTIVE',
+    packs: [
+      { orders: [{ id: String(nroVenta), quantity: 1 }] },
+      { orders: [{ id: String(nroVenta), quantity: unidades - 1 }] }
+    ]
+  };
+  const r = await fetch(`https://api.mercadolibre.com/shipments/${shipmentId}/split`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'x-format-new': 'true' },
+    body: JSON.stringify(body)
+  });
+  const txt = await r.text();
+  if (!r.ok) {
+    console.error('[SEPARAR] ML', r.status, txt);
+    throw new Error(`ML respondió ${r.status}: ${(txt || '').substring(0, 200)}`);
+  }
+  return unidades === 2 ? '1 + 1' : `1 + ${unidades - 1}`;
+}
+
 app.post('/api/despacho/separar', async (req, res) => {
   try {
     const shipmentId = (req.body && req.body.shipment_id) || null;
@@ -858,27 +881,30 @@ app.post('/api/despacho/separar', async (req, res) => {
     if (!unidades || unidades < 2) return res.status(400).json({ error: 'La venta no tiene 2 o más unidades' });
     const token = await getValidToken(ML_USER_ID);
     if (!token) throw new Error('No hay token de ML');
-    // ML solo deja separar en 2 cajas por vez: 1 unidad va sola, el resto en la otra caja.
-    const body = {
-      reason: 'OTHER_MOTIVE',
-      packs: [
-        { orders: [{ id: String(nroVenta), quantity: 1 }] },
-        { orders: [{ id: String(nroVenta), quantity: unidades - 1 }] }
-      ]
-    };
-    const r = await fetch(`https://api.mercadolibre.com/shipments/${shipmentId}/split`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'x-format-new': 'true' },
-      body: JSON.stringify(body)
-    });
-    const txt = await r.text();
-    if (!r.ok) {
-      console.error('[SEPARAR] ML', r.status, txt);
-      return res.status(400).json({ error: `ML respondió ${r.status}: ${(txt || '').substring(0, 300)}` });
+    const separado = await mlSepararEnvio(token, shipmentId, nroVenta, unidades);
+    console.log(`[SEPARAR] OK ship=${shipmentId} venta=${nroVenta} (${separado})`);
+    res.json({ ok: true, separado_en: separado });
+  } catch (e) { console.error('[SEPARAR]', e.message); res.status(400).json({ error: e.message }); }
+});
+
+// Separar varias ventas de una vez (una por una, con pausa para no saturar ML).
+app.post('/api/despacho/separar-lote', async (req, res) => {
+  try {
+    const items = (req.body && req.body.items) || [];
+    if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'No mandaste ventas para separar' });
+    const token = await getValidToken(ML_USER_ID);
+    if (!token) throw new Error('No hay token de ML');
+    let ok = 0; const errores = [];
+    for (const it of items) {
+      const u = parseInt(it.unidades || 0, 10);
+      if (!it.shipment_id || !it.nro_venta || u < 2) { errores.push({ nro_venta: it.nro_venta || '?', error: 'datos inválidos' }); continue; }
+      try { await mlSepararEnvio(token, it.shipment_id, it.nro_venta, u); ok++; }
+      catch (e) { errores.push({ nro_venta: it.nro_venta, error: e.message }); }
+      await sleep(300);
     }
-    console.log(`[SEPARAR] OK ship=${shipmentId} venta=${nroVenta} (${unidades}u → 1 + ${unidades - 1})`);
-    res.json({ ok: true, separado_en: unidades === 2 ? '1 + 1' : `1 + ${unidades - 1}` });
-  } catch (e) { console.error('[SEPARAR]', e.message); res.status(500).json({ error: e.message }); }
+    console.log(`[SEPARAR-LOTE] ${ok} ok, ${errores.length} con error`);
+    res.json({ ok_count: ok, error_count: errores.length, errores });
+  } catch (e) { console.error('[SEPARAR-LOTE]', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // ── Endpoints: impresión ──────────────────────────────────────────
@@ -1953,7 +1979,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.5-reconectar' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.6-separar-lote' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

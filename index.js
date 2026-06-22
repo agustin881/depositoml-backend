@@ -103,7 +103,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function requireAuth(req, res, next) {
   try {
     // Excepción temporal: diagnóstico accesible con clave en la URL (para debug)
-    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas' || req.path === '/diag-fechas' || req.path === '/diag-nodo') && (req.query.clave || '') === 'pontec2026') return next();
+    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas' || req.path === '/diag-fechas' || req.path === '/diag-nodo' || req.path === '/diag-imprimir') && (req.query.clave || '') === 'pontec2026') return next();
     const h = req.headers.authorization || '';
     const token = h.startsWith('Bearer ') ? h.slice(7) : '';
     if (!token) return res.status(401).json({ error: 'No autorizado' });
@@ -813,7 +813,60 @@ app.get('/api/despacho/panel', async (_req, res) => {
   } catch (e) { console.error('[PANEL]', e.message); res.status(500).json({ error: e.message }); }
 });
 
-// ── SEPARAR: ventas de Colecta con 2+ unidades que se pueden dividir ──
+// ── DIAG: por qué el badge de Imprimir (Flex+Colecta) no coincide con el ──
+// total "para imprimir". Lista las que NO son Flex ni Colecta. ?clave=pontec2026
+app.get('/api/despacho/diag-imprimir', async (_req, res) => {
+  try {
+    const { data: imp } = await supabase.from('dep_impresiones').select('shipment_id');
+    const impSet = new Set((imp || []).map(r => r.shipment_id));
+    const { data: desp } = await supabase.from('dep_despachos').select('shipment_id');
+    const despSet = new Set((desp || []).map(r => r.shipment_id));
+
+    let envios = [], from = 0;
+    while (true) {
+      const { data, error } = await supabase.from('dep_envios')
+        .select('shipment_id,nro_venta,sku,titulo,tipo,status,substatus,limite,es_nuestro,cancelada')
+        .eq('es_nuestro', true).neq('tipo', 'full').range(from, from + 999);
+      if (error) throw new Error(error.message);
+      if (!data || !data.length) break;
+      envios = envios.concat(data);
+      if (data.length < 1000) break;
+      from += 1000;
+    }
+    const hoy = fechaHoyART();
+    const esFuturo = s => s.limite && String(s.limite) > hoy;
+    const imprimible = s => s.status === 'ready_to_ship' &&
+      (s.substatus === 'ready_to_print' || s.substatus === 'ready_to_ship' || !s.substatus);
+    const TERM = ['shipped', 'delivered', 'not_delivered', 'returned', 'cancelled'];
+
+    const paraImprimir = [];
+    for (const s of envios) {
+      if (s.cancelada || s.status === 'cancelled') continue;
+      if (TERM.includes(s.status)) continue;
+      if (despSet.has(s.shipment_id)) continue;   // despachada
+      if (impSet.has(s.shipment_id)) continue;     // en preparación (ya impresa)
+      if (!imprimible(s) && esFuturo(s)) continue; // programada
+      if (!imprimible(s)) continue;                // en proceso, no imprimible
+      paraImprimir.push(s);
+    }
+    const porTipo = {};
+    for (const s of paraImprimir) { const t = s.tipo || '(sin tipo)'; porTipo[t] = (porTipo[t] || 0) + 1; }
+    const otros = paraImprimir
+      .filter(s => s.tipo !== 'flex' && s.tipo !== 'colecta')
+      .map(s => ({ nro_venta: s.nro_venta, sku: s.sku, titulo: s.titulo,
+                   tipo: s.tipo || '(sin tipo)', status: s.status, substatus: s.substatus }));
+
+    res.json({
+      total_para_imprimir_foto: paraImprimir.length,
+      flex: porTipo.flex || 0,
+      colecta: porTipo.colecta || 0,
+      otros_cant: otros.length,
+      badge_imprimir_seria: (porTipo.flex || 0) + (porTipo.colecta || 0),
+      por_tipo: porTipo,
+      otros
+    });
+  } catch (e) { console.error('[DIAG-IMPRIMIR]', e.message); res.status(500).json({ error: e.message }); }
+});
 app.get('/api/despacho/separables', async (_req, res) => {
   try {
     const { data: imp } = await supabase.from('dep_impresiones').select('shipment_id');
@@ -1979,7 +2032,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.6-separar-lote' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.7-diagimprimir' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

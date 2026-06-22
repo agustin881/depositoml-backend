@@ -765,6 +765,9 @@ app.get('/api/despacho/panel', async (_req, res) => {
     const etapas = { para_imprimir: [], programados: [], en_preparacion: [],
                      despachadas: [], en_camino: [], entregadas: [], devoluciones: [] };
     const TERMINADOS = ['shipped', 'delivered', 'not_delivered', 'returned', 'cancelled'];
+    // Sub-estados que indican que el paquete ya salió del depósito (en la red de ML).
+    const EN_RED_ML = new Set(['in_hub', 'in_warehouse', 'on_route', 'in_route',
+      'out_for_delivery', 'soon_deliver', 'delivering', 'arrived', 'picked_up', 'dispatched']);
 
     for (const s of envios) {
       const d = despMap.get(s.shipment_id);
@@ -785,10 +788,10 @@ app.get('/api/despacho/panel', async (_req, res) => {
       else if (s.status === 'delivered')                    etapas.entregadas.push(fila);
       else if (s.status === 'shipped')                      etapas.en_camino.push(fila);
       else if (d)                                           etapas.despachadas.push(fila);
+      else if (EN_RED_ML.has(s.substatus))                  etapas.en_camino.push(fila); // ya salió (en hub / en ruta)
       else if (impSet.has(s.shipment_id))                   etapas.en_preparacion.push(fila);
-      else if (!imprimible(s) && esFuturo(s))               etapas.programados.push(fila);
       else if (imprimible(s))                               etapas.para_imprimir.push(fila);
-      // (lo que está en proceso y no imprimible ni futuro queda sin etapa visible)
+      else                                                  etapas.programados.push(fila); // futura o "en procesamiento" (todavía no salió)
     }
     for (const k of Object.keys(etapas)) etapas[k].sort(ordenarPorSku);
 
@@ -1394,6 +1397,33 @@ async function resolverEscaneo(codigo, token) {
 
 // ── Endpoint: DESPACHAR (escaneo al cargar el camión) ─────────────
 // Chequea EN VIVO contra ML que la venta no esté cancelada antes de registrar.
+// Bajar un paquete de la colecta/destino: borra su registro de despacho.
+app.post('/api/despacho/bajar', async (req, res) => {
+  try {
+    const codigo = ((req.body && req.body.codigo) || '').trim();
+    if (!codigo) return res.status(400).json({ error: 'Falta el código escaneado' });
+    let ids = [];
+    try { const j = JSON.parse(codigo); if (j && j.id) ids.push(String(j.id)); } catch (_) {}
+    ids = ids.concat(extraerNumeros(codigo)).filter(Boolean).map(String);
+    ids = [...new Set(ids)];
+    if (!ids.length) return res.status(400).json({ error: 'No pude leer el código' });
+    const lista = ids.join(',');
+    const { data: encontrados, error: e1 } = await supabase.from('dep_despachos')
+      .select('shipment_id,nro_venta,sku,titulo,destino_nombre')
+      .or(`shipment_id.in.(${lista}),nro_venta.in.(${lista})`)
+      .order('despachado_at', { ascending: false }).limit(1);
+    if (e1) throw new Error(e1.message);
+    if (!encontrados || !encontrados.length)
+      return res.json({ resultado: 'no_estaba' });
+    const ship = encontrados[0];
+    const { error: e2 } = await supabase.from('dep_despachos').delete().eq('shipment_id', ship.shipment_id);
+    if (e2) throw new Error(e2.message);
+    console.log(`[BAJAR] saqué ${ship.shipment_id} (venta ${ship.nro_venta}) de ${ship.destino_nombre || '?'}`);
+    res.json({ resultado: 'bajado', shipment_id: ship.shipment_id, nro_venta: ship.nro_venta,
+      sku: ship.sku, titulo: ship.titulo, destino_nombre: ship.destino_nombre });
+  } catch (e) { console.error('[BAJAR]', e.message); res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/despacho/despachar', async (req, res) => {
   try {
     const codigo = ((req.body && req.body.codigo) || '').trim();
@@ -2040,7 +2070,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.10-en-camino-fix' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.11-bajar-unifica' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

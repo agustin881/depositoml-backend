@@ -1751,6 +1751,9 @@ app.get('/api/despacho/seguimiento', async (_req, res) => {
     const esFuturo = s => s.limite && String(s.limite).substring(0,10) > hoy;
     const imprimible = s => s.status === 'ready_to_ship' &&
       (s.substatus === 'ready_to_print' || s.substatus === 'ready_to_ship' || !s.substatus);
+    // Sub-estados que indican que el paquete YA salió del depósito y está en la red de ML.
+    const EN_RED_ML = new Set(['in_hub', 'in_warehouse', 'on_route', 'in_route',
+      'out_for_delivery', 'soon_deliver', 'delivering', 'arrived', 'picked_up', 'dispatched']);
     const b = { para_imprimir: [], programados: [], en_preparacion: [],
                 despachadas: [], en_camino: [], entregadas: [], devoluciones: [] };
 
@@ -1769,9 +1772,10 @@ app.get('/api/despacho/seguimiento', async (_req, res) => {
       else if (s.status === 'shipped')                      b.en_camino.push(fila);
       else if (s.status === 'cancelled')                    continue; // canceladas sin despachar: afuera
       else if (desMap.has(s.shipment_id))                   b.despachadas.push(fila);
+      else if (EN_RED_ML.has(s.substatus))                  b.en_camino.push(fila); // ya salió (en hub / en ruta)
       else if (impSet.has(s.shipment_id))                   b.en_preparacion.push(fila);
       else if (imprimible(s))                               b.para_imprimir.push(fila);
-      else                                                  b.programados.push(fila); // futura o "en procesamiento": todavía no está lista para imprimir
+      else                                                  b.programados.push(fila); // en procesamiento / despacho futuro (todavía no salió)
     }
     for (const k of Object.keys(b)) b[k].sort(ordenarPorSku);
 
@@ -2036,7 +2040,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.9-seguimiento-fix' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.10-en-camino-fix' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

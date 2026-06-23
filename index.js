@@ -917,6 +917,7 @@ app.get('/api/despacho/separables', async (_req, res) => {
             try { await supabase.from('dep_envios').update({ status: sh.status, substatus: sh.substatus || null }).eq('shipment_id', s.shipment_id); } catch (_) {}
             return { s, keep: false };
           }
+          s._st = sh.status; s._sub = sh.substatus || '';
           return { s, keep: true };
         } catch (_) { return { s, keep: true }; }
       });
@@ -925,7 +926,8 @@ app.get('/api/despacho/separables', async (_req, res) => {
 
     const lista = buenos.map(s => ({
       shipment_id: s.shipment_id, nro_venta: s.nro_venta, sku: s.sku, titulo: s.titulo,
-      unidades: s.unidades || 2, impresa: impSet.has(s.shipment_id)
+      unidades: s.unidades || 2, impresa: impSet.has(s.shipment_id),
+      estado: s._st || s.status || '', sub: (s._sub != null ? s._sub : s.substatus) || ''
     }));
     lista.sort(ordenarPorSku);
     res.json({ cantidad: lista.length, separables: lista });
@@ -2165,7 +2167,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.14-separables-verif' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.15-separables-estado' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

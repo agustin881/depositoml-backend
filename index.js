@@ -1428,17 +1428,35 @@ app.post('/api/despacho/bajar', async (req, res) => {
 app.get('/api/despacho/historial', async (req, res) => {
   try {
     const venta = (req.query.venta || '').trim();
-    const cols = 'nro_venta,shipment_id,sku,titulo,tipo,destino_nombre,colecta_patente,transportista,despachado_at,usuario';
+    const cols = 'nro_venta,shipment_id,sku,titulo,tipo,destino_id,destino_nombre,colecta_patente,transportista,despachado_at,usuario';
+
+    // Completa cada fila con el camión/patente que se asignó al destino al abrirlo.
+    async function enriquecer(rows) {
+      const ids = [...new Set(rows.map(r => r.destino_id).filter(Boolean))];
+      const m = {};
+      if (ids.length) {
+        const { data } = await supabase.from('dep_destinos')
+          .select('id,patente,descripcion,transportista').in('id', ids);
+        for (const d of (data || [])) m[d.id] = d;
+      }
+      for (const r of rows) {
+        const dd = m[r.destino_id] || {};
+        r.patente = dd.patente || r.colecta_patente || '';
+        r.camion = dd.descripcion || '';
+      }
+      return rows;
+    }
+
     if (venta) {
       const { data, error } = await supabase.from('dep_despachos').select(cols)
         .or(`nro_venta.eq.${venta},shipment_id.eq.${venta}`)
         .order('despachado_at', { ascending: false });
       if (error) throw new Error(error.message);
-      return res.json({ modo: 'venta', venta, resultados: data || [] });
+      return res.json({ modo: 'venta', venta, resultados: await enriquecer(data || []) });
     }
     const fecha = (req.query.fecha || '').trim();
     if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) return res.status(400).json({ error: 'Indicá una fecha (o un número de venta)' });
-    const desde = `${fecha}T00:00:00-03:00`;          // día completo en hora Argentina
+    const desde = `${fecha}T00:00:00-03:00`;
     const hasta = `${fecha}T23:59:59.999-03:00`;
     let rows = [], from = 0;
     while (true) {
@@ -1451,10 +1469,15 @@ app.get('/api/despacho/historial', async (req, res) => {
       if (data.length < 1000) break;
       from += 1000;
     }
+    await enriquecer(rows);
     const grupos = {};
     for (const r of rows) {
       const key = r.destino_nombre || (r.tipo === 'flex' ? 'Flex' : 'Colecta');
-      if (!grupos[key]) grupos[key] = { destino: key, tipo: r.tipo, ref: r.colecta_patente || r.transportista || '', items: [] };
+      if (!grupos[key]) {
+        // Para Colecta mostramos el camión (patente · descripción); para Flex el nombre ya es el transportista.
+        const ref = r.tipo === 'colecta' ? [r.patente, r.camion].filter(Boolean).join(' · ') : '';
+        grupos[key] = { destino: key, tipo: r.tipo, ref, items: [] };
+      }
       grupos[key].items.push(r);
     }
     const lista = Object.values(grupos).sort((a, b) =>
@@ -2114,7 +2137,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.12-historial' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.13-historial-camion' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

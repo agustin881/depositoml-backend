@@ -880,7 +880,7 @@ app.get('/api/despacho/separables', async (_req, res) => {
     let envios = [], from = 0;
     while (true) {
       const { data, error } = await supabase.from('dep_envios')
-        .select('shipment_id,nro_venta,sku,titulo,unidades,tipo,status,cancelada')
+        .select('shipment_id,nro_venta,sku,titulo,unidades,tipo,status,substatus,cancelada')
         .eq('es_nuestro', true).eq('tipo', 'colecta').gte('unidades', 2)
         .range(from, from + 999);
       if (error) throw new Error(error.message);
@@ -890,15 +890,43 @@ app.get('/api/despacho/separables', async (_req, res) => {
       from += 1000;
     }
     const TERMINADOS = ['shipped', 'delivered', 'not_delivered', 'returned', 'cancelled'];
-    const lista = [];
+    const EN_RED_ML = new Set(['in_hub', 'in_warehouse', 'on_route', 'in_route',
+      'out_for_delivery', 'soon_deliver', 'delivering', 'arrived', 'picked_up', 'dispatched']);
+
+    // Candidatos según la foto (rápido)
+    const candidatos = [];
     for (const s of envios) {
-      if (s.cancelada || TERMINADOS.includes(s.status)) continue; // ya no aplica
-      if (despSet.has(s.shipment_id)) continue;                   // ya despachada
-      lista.push({
-        shipment_id: s.shipment_id, nro_venta: s.nro_venta, sku: s.sku, titulo: s.titulo,
-        unidades: s.unidades || 2, impresa: impSet.has(s.shipment_id)
-      });
+      if (s.cancelada || TERMINADOS.includes(s.status) || EN_RED_ML.has(s.substatus)) continue; // ya salió
+      if (despSet.has(s.shipment_id)) continue;                                                  // ya la escaneamos
+      candidatos.push(s);
     }
+
+    // Verificar el estado REAL en ML (la foto puede estar vieja para ventas que nunca escaneamos).
+    // Si ML dice que ya salió (despachada / en camino), la sacamos y corregimos la foto.
+    const token = await getValidToken(ML_USER_ID);
+    let buenos = candidatos;
+    if (token && candidatos.length) {
+      const auth = { headers: { Authorization: `Bearer ${token}` } };
+      const verif = await poolMap(candidatos, 5, async (s) => {
+        try {
+          const r = await fetch(`https://api.mercadolibre.com/shipments/${s.shipment_id}`, auth);
+          if (!r.ok) return { s, keep: true };               // si no se pudo verificar, no la escondemos
+          const sh = await r.json();
+          const yaFue = TERMINADOS.includes(sh.status) || EN_RED_ML.has(sh.substatus);
+          if (yaFue) {
+            try { await supabase.from('dep_envios').update({ status: sh.status, substatus: sh.substatus || null }).eq('shipment_id', s.shipment_id); } catch (_) {}
+            return { s, keep: false };
+          }
+          return { s, keep: true };
+        } catch (_) { return { s, keep: true }; }
+      });
+      buenos = verif.filter(x => x.keep).map(x => x.s);
+    }
+
+    const lista = buenos.map(s => ({
+      shipment_id: s.shipment_id, nro_venta: s.nro_venta, sku: s.sku, titulo: s.titulo,
+      unidades: s.unidades || 2, impresa: impSet.has(s.shipment_id)
+    }));
     lista.sort(ordenarPorSku);
     res.json({ cantidad: lista.length, separables: lista });
   } catch (e) { console.error('[SEPARABLES]', e.message); res.status(500).json({ error: e.message }); }
@@ -2137,7 +2165,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.13-historial-camion' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.14-separables-verif' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

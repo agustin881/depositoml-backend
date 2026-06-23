@@ -1424,6 +1424,50 @@ app.post('/api/despacho/bajar', async (req, res) => {
   } catch (e) { console.error('[BAJAR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// Historial de despachos: por fecha (agrupado por destino) o búsqueda por venta.
+app.get('/api/despacho/historial', async (req, res) => {
+  try {
+    const venta = (req.query.venta || '').trim();
+    const cols = 'nro_venta,shipment_id,sku,titulo,tipo,destino_nombre,colecta_patente,transportista,despachado_at,usuario';
+    if (venta) {
+      const { data, error } = await supabase.from('dep_despachos').select(cols)
+        .or(`nro_venta.eq.${venta},shipment_id.eq.${venta}`)
+        .order('despachado_at', { ascending: false });
+      if (error) throw new Error(error.message);
+      return res.json({ modo: 'venta', venta, resultados: data || [] });
+    }
+    const fecha = (req.query.fecha || '').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) return res.status(400).json({ error: 'Indicá una fecha (o un número de venta)' });
+    const desde = `${fecha}T00:00:00-03:00`;          // día completo en hora Argentina
+    const hasta = `${fecha}T23:59:59.999-03:00`;
+    let rows = [], from = 0;
+    while (true) {
+      const { data, error } = await supabase.from('dep_despachos').select(cols)
+        .gte('despachado_at', desde).lte('despachado_at', hasta)
+        .order('despachado_at', { ascending: true }).range(from, from + 999);
+      if (error) throw new Error(error.message);
+      if (!data || !data.length) break;
+      rows = rows.concat(data);
+      if (data.length < 1000) break;
+      from += 1000;
+    }
+    const grupos = {};
+    for (const r of rows) {
+      const key = r.destino_nombre || (r.tipo === 'flex' ? 'Flex' : 'Colecta');
+      if (!grupos[key]) grupos[key] = { destino: key, tipo: r.tipo, ref: r.colecta_patente || r.transportista || '', items: [] };
+      grupos[key].items.push(r);
+    }
+    const lista = Object.values(grupos).sort((a, b) =>
+      (a.tipo === 'colecta' ? 0 : 1) - (b.tipo === 'colecta' ? 0 : 1) || a.destino.localeCompare(b.destino));
+    res.json({
+      modo: 'fecha', fecha, total: rows.length,
+      colecta: rows.filter(r => r.tipo === 'colecta').length,
+      flex: rows.filter(r => r.tipo === 'flex').length,
+      grupos: lista
+    });
+  } catch (e) { console.error('[HISTORIAL]', e.message); res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/despacho/despachar', async (req, res) => {
   try {
     const codigo = ((req.body && req.body.codigo) || '').trim();
@@ -2070,7 +2114,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.11-bajar-unifica' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.12-historial' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

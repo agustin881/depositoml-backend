@@ -103,7 +103,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function requireAuth(req, res, next) {
   try {
     // Excepción temporal: diagnóstico accesible con clave en la URL (para debug)
-    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas' || req.path === '/diag-fechas' || req.path === '/diag-nodo' || req.path === '/diag-imprimir') && (req.query.clave || '') === 'pontec2026') return next();
+    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas' || req.path === '/diag-fechas' || req.path === '/diag-nodo' || req.path === '/diag-imprimir' || req.path === '/diag-camion') && (req.query.clave || '') === 'pontec2026') return next();
     const h = req.headers.authorization || '';
     const token = h.startsWith('Bearer ') ? h.slice(7) : '';
     if (!token) return res.status(401).json({ error: 'No autorizado' });
@@ -1185,6 +1185,48 @@ async function colectasDelDia(token) {
   return colectas;
 }
 
+// ── DIAGNÓSTICO: ¿dónde está el transportista/patente de la colecta? ──
+// /api/despacho/diag-camion?clave=pontec2026  (opcional &ship=SHIPMENT_ID)
+app.get('/api/despacho/diag-camion', async (req, res) => {
+  if ((req.query.clave || '') !== 'pontec2026')
+    return res.status(401).json({ error: 'Agregá ?clave=pontec2026' });
+  try {
+    const token = await getValidToken(ML_USER_ID);
+    if (!token) throw new Error('No hay token de ML disponible');
+    const auth = { headers: { Authorization: `Bearer ${token}` } };
+    const probar = async (url) => {
+      try {
+        const r = await fetch(url, auth);
+        let b; try { b = await r.json(); } catch { b = await r.text(); }
+        const s = JSON.stringify(b);
+        return { url, status: r.status, body: (s && s.length > 6000) ? { recortado: true, muestra: s.slice(0, 5500) } : b };
+      } catch (e) { return { url, error: e.message }; }
+    };
+    // Tomamos un envío de colecta real (listo, no despachado) para inspeccionarlo
+    let shipId = (req.query.ship || '').trim();
+    if (!shipId) {
+      const { data } = await supabase.from('dep_envios')
+        .select('shipment_id,status').eq('es_nuestro', true).eq('tipo', 'colecta')
+        .in('status', ['ready_to_ship', 'handling']).limit(1);
+      shipId = data && data[0] ? data[0].shipment_id : '';
+    }
+    const U = ML_USER_ID;
+    const urls = [];
+    if (shipId) {
+      urls.push(`https://api.mercadolibre.com/shipments/${shipId}`);
+      urls.push(`https://api.mercadolibre.com/shipments/${shipId}/carrier`);
+      urls.push(`https://api.mercadolibre.com/shipments/${shipId}/lead_time`);
+    }
+    urls.push(`https://api.mercadolibre.com/users/${U}/shipping/schedule/cross_docking?node_id=ARXRO1`);
+    urls.push(`https://api.mercadolibre.com/shipping/carrier_pickup/17500940`);
+    urls.push(`https://api.mercadolibre.com/users/${U}/pickups`);
+    urls.push(`https://api.mercadolibre.com/shipping/pickups/search?seller_id=${U}`);
+    const resultados = [];
+    for (const u of urls) { resultados.push(await probar(u)); await sleep(150); }
+    res.json({ shipment_muestra: shipId, resultados });
+  } catch (e) { console.error('[DIAG-CAMION]', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // ── DIAGNÓSTICO de COLECTAS: prueba varias URLs de ML y muestra cuál responde ──
 // /api/despacho/diag-colectas?clave=pontec2026
 app.get('/api/despacho/diag-colectas', async (req, res) => {
@@ -2167,7 +2209,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.15-separables-estado' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.16-diag-camion' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

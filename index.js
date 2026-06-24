@@ -1864,12 +1864,18 @@ app.post('/api/despacho/destinos/abrir', async (req, res) => {
           .select('patente,descripcion').eq('id', camionId).limit(1);
         if (cam && cam[0]) { patente = cam[0].patente || ''; descripcion = cam[0].descripcion || ''; }
       }
-      // Numerar: Colecta 1, Colecta 2, … (según las creadas hoy, abiertas o cerradas)
-      const { data: colsHoy } = await supabase.from('dep_destinos')
-        .select('id').eq('fecha', fecha).eq('tipo', 'colecta');
-      const n = (colsHoy || []).length + 1;
-      row.nombre = `Colecta ${n}`;
-      row.colecta_horario = '';
+      // Nombre: por horario elegido ("Colecta 10:00–12:00") o, si no hay, numerada
+      const horario = ((req.body && req.body.horario) || '').trim();
+      if (horario) {
+        row.nombre = `Colecta ${horario}`;
+        row.colecta_horario = horario;
+      } else {
+        const { data: colsHoy } = await supabase.from('dep_destinos')
+          .select('id').eq('fecha', fecha).eq('tipo', 'colecta');
+        const n = (colsHoy || []).length + 1;
+        row.nombre = `Colecta ${n}`;
+        row.colecta_horario = '';
+      }
       row.camion_id = camionId;
       row.patente = patente;
       row.descripcion = descripcion;
@@ -2236,7 +2242,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.17-config-camiones' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.18-colecta-horario' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

@@ -934,7 +934,19 @@ app.get('/api/despacho/separables', async (_req, res) => {
           try { await supabase.from('dep_envios').update({ status: sh.status, substatus: sh.substatus || null, unidades: units }).eq('shipment_id', s.shipment_id); } catch (_) {}
           if (yaFue) return null;                 // ya salió
           if (units < 2 && nItems < 2) return null; // ni multi-unidad ni multi-producto
-          return { ...s, unidades: units, _nitems: nItems, _st: sh.status, _sub: sh.substatus || '' };
+          // Traer los SKUs de todos los productos de la venta (shipping_items no trae el SKU)
+          let skus = [s.sku].filter(Boolean);
+          try {
+            const ro = await fetch(`https://api.mercadolibre.com/orders/${s.nro_venta}?access_token=${token}`);
+            const order = await ro.json();
+            if (order && Array.isArray(order.order_items)) {
+              const ss = order.order_items
+                .map(it => (it.item && (it.item.seller_sku || it.item.seller_custom_field)) || '')
+                .map(x => String(x).trim()).filter(Boolean);
+              if (ss.length) skus = [...new Set(ss)];
+            }
+          } catch (_) {}
+          return { ...s, unidades: units, _nitems: nItems, _skus: skus, _st: sh.status, _sub: sh.substatus || '' };
         } catch (_) { return null; }
       });
       buenos = verif.filter(Boolean);
@@ -944,7 +956,8 @@ app.get('/api/despacho/separables', async (_req, res) => {
     }
 
     const lista = buenos.map(s => ({
-      shipment_id: s.shipment_id, nro_venta: s.nro_venta, sku: s.sku, titulo: s.titulo,
+      shipment_id: s.shipment_id, nro_venta: s.nro_venta,
+      sku: s.sku, skus: (s._skus && s._skus.length ? s._skus : [s.sku].filter(Boolean)), titulo: s.titulo,
       unidades: s.unidades || 2, productos: s._nitems || 1, impresa: impSet.has(s.shipment_id),
       estado: s._st || s.status || '', sub: (s._sub != null ? s._sub : s.substatus) || ''
     }));
@@ -2301,7 +2314,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.20-multiproducto-cron' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.21-skus-pack' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

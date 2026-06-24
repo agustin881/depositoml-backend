@@ -1285,6 +1285,38 @@ app.get('/api/despacho/diag-skus', async (req, res) => {
       }));
     }
     if (shipJson) out.shipping_items = (shipJson.shipping_items || []).map(it => ({ description: it.description, quantity: it.quantity }));
+
+    // Buscar el envío de esa venta y, vía el envío, TODAS las órdenes del pack con sus SKU
+    if (venta && !ship) {
+      try {
+        const ro2 = await fetch(`https://api.mercadolibre.com/orders/${venta}?access_token=${token}`);
+        const ord2 = await ro2.json();
+        const shipId = ord2.shipping && ord2.shipping.id;
+        const packId = ord2.pack_id;
+        out.pack_id = packId || null;
+        out.shipment_id_de_la_venta = shipId || null;
+        if (shipId) {
+          const rs2 = await fetch(`https://api.mercadolibre.com/shipments/${shipId}?access_token=${token}`);
+          const sh2 = await rs2.json();
+          out.shipment_items = (sh2.shipping_items || []).map(it => ({ description: it.description, quantity: it.quantity }));
+          // El shipment referencia todas las órdenes del pack
+          const oids = sh2.order_ids && sh2.order_ids.length ? sh2.order_ids
+                     : (sh2.order_id ? [sh2.order_id] : (venta ? [venta] : []));
+          out.order_ids_del_envio = oids;
+          const skusPack = [];
+          for (const oid of oids) {
+            try {
+              const r = await fetch(`https://api.mercadolibre.com/orders/${oid}?access_token=${token}`);
+              const o = await r.json();
+              for (const it of (o.order_items || [])) {
+                skusPack.push({ venta: String(oid), sku: it.item && it.item.seller_sku, title: it.item && it.item.title, quantity: it.quantity });
+              }
+            } catch (_) {}
+          }
+          out.skus_del_pack = skusPack;
+        }
+      } catch (e) { out.pack_error = e.message; }
+    }
     res.json(out);
   } catch (e) { console.error('[DIAG-SKUS]', e.message); res.status(500).json({ error: e.message }); }
 });
@@ -2395,7 +2427,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.24-diag-skus' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.25-diag-skus-pack' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

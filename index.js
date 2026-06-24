@@ -263,12 +263,18 @@ async function obtenerShipmentsDetallados(token, onLote) {
     const item = (o.order_items && o.order_items[0]) || {};
     const sku  = (item.item && (item.item.seller_sku || item.item.seller_custom_field)) || '';
     const titulo = (item.item && item.item.title) || '';
+    // Unidades = suma de TODOS los productos de la orden (no solo el primero)
+    const unidadesOrden = (o.order_items || []).reduce((a, it) => a + (it.quantity || 0), 0) || 1;
     if (!porShipment.has(shipId)) {
       porShipment.set(shipId, {
         shipment_id: String(shipId), nro_venta: String(o.id),
         pack_id: o.pack_id ? String(o.pack_id) : null,
-        sku: sku ? String(sku).trim() : '', titulo, unidades: item.quantity || 1
+        sku: sku ? String(sku).trim() : '', titulo, unidades: unidadesOrden
       });
+    } else {
+      // Pack con varias órdenes en el mismo envío: sumamos las unidades
+      const ex = porShipment.get(shipId);
+      ex.unidades = (ex.unidades || 0) + unidadesOrden;
     }
   }
 
@@ -377,7 +383,8 @@ async function actualizarFotoEnvio(shipmentId, token) {
           s.sku = (item.item && (item.item.seller_sku || item.item.seller_custom_field)) || '';
           s.sku = s.sku ? String(s.sku).trim() : '';
           s.titulo = (item.item && item.item.title) || '';
-          s.unidades = item.quantity || 1;
+          s.unidades = ((ship.shipping_items || []).reduce((a, it) => a + (it.quantity || 0), 0))
+            || ((order.order_items || []).reduce((a, it) => a + (it.quantity || 0), 0)) || 1;
           if (order.status === 'cancelled') s.status = s.status || 'cancelled';
           s._orderStatus = order.status;
         }
@@ -877,11 +884,13 @@ app.get('/api/despacho/separables', async (_req, res) => {
     const { data: desp } = await supabase.from('dep_despachos').select('shipment_id');
     const despSet = new Set((desp || []).map(r => r.shipment_id));
 
+    // Traemos TODA la colecta lista (sin filtrar por unidades): así cazamos también
+    // las ventas multi-producto que quedaron mal contadas en la foto (unidades=1).
     let envios = [], from = 0;
     while (true) {
       const { data, error } = await supabase.from('dep_envios')
         .select('shipment_id,nro_venta,sku,titulo,unidades,tipo,status,substatus,cancelada')
-        .eq('es_nuestro', true).eq('tipo', 'colecta').gte('unidades', 2)
+        .eq('es_nuestro', true).eq('tipo', 'colecta')
         .range(from, from + 999);
       if (error) throw new Error(error.message);
       if (!data || !data.length) break;
@@ -893,40 +902,50 @@ app.get('/api/despacho/separables', async (_req, res) => {
     const EN_RED_ML = new Set(['in_hub', 'in_warehouse', 'on_route', 'in_route',
       'out_for_delivery', 'soon_deliver', 'delivering', 'arrived', 'picked_up', 'dispatched']);
 
-    // Candidatos según la foto (rápido)
-    const candidatos = [];
+    // Candidatos: colecta lista, no cancelada, no terminada, no ya escaneada
+    let candidatos = [];
     for (const s of envios) {
-      if (s.cancelada || TERMINADOS.includes(s.status) || EN_RED_ML.has(s.substatus)) continue; // ya salió
-      if (despSet.has(s.shipment_id)) continue;                                                  // ya la escaneamos
+      if (s.cancelada || TERMINADOS.includes(s.status) || EN_RED_ML.has(s.substatus)) continue;
+      if (despSet.has(s.shipment_id)) continue;
       candidatos.push(s);
     }
+    // Tope de seguridad: si hubiera muchísimas, verificamos primero las que la foto ya marca 2+
+    const TOPE = 160;
+    if (candidatos.length > TOPE) {
+      candidatos.sort((a, b) => (b.unidades || 0) - (a.unidades || 0));
+      candidatos = candidatos.slice(0, TOPE);
+    }
 
-    // Verificar el estado REAL en ML (la foto puede estar vieja para ventas que nunca escaneamos).
-    // Si ML dice que ya salió (despachada / en camino), la sacamos y corregimos la foto.
+    // Verificamos en vivo cada envío: estado real + unidades reales (todos los productos del pack).
+    // Si ya salió → se saca; si tiene 2+ cosas → entra; y de paso corregimos la foto.
     const token = await getValidToken(ML_USER_ID);
-    let buenos = candidatos;
+    let buenos = [];
     if (token && candidatos.length) {
       const auth = { headers: { Authorization: `Bearer ${token}` } };
-      const verif = await poolMap(candidatos, 5, async (s) => {
+      const verif = await poolMap(candidatos, 6, async (s) => {
         try {
           const r = await fetch(`https://api.mercadolibre.com/shipments/${s.shipment_id}`, auth);
-          if (!r.ok) return { s, keep: true };               // si no se pudo verificar, no la escondemos
+          if (!r.ok) return null;
           const sh = await r.json();
           const yaFue = TERMINADOS.includes(sh.status) || EN_RED_ML.has(sh.substatus);
-          if (yaFue) {
-            try { await supabase.from('dep_envios').update({ status: sh.status, substatus: sh.substatus || null }).eq('shipment_id', s.shipment_id); } catch (_) {}
-            return { s, keep: false };
-          }
-          s._st = sh.status; s._sub = sh.substatus || '';
-          return { s, keep: true };
-        } catch (_) { return { s, keep: true }; }
+          const units = (sh.shipping_items || []).reduce((a, it) => a + (it.quantity || 0), 0) || (s.unidades || 1);
+          const nItems = (sh.shipping_items || []).length || 1;
+          // Autocorregir la foto (estado + unidades reales)
+          try { await supabase.from('dep_envios').update({ status: sh.status, substatus: sh.substatus || null, unidades: units }).eq('shipment_id', s.shipment_id); } catch (_) {}
+          if (yaFue) return null;                 // ya salió
+          if (units < 2 && nItems < 2) return null; // ni multi-unidad ni multi-producto
+          return { ...s, unidades: units, _nitems: nItems, _st: sh.status, _sub: sh.substatus || '' };
+        } catch (_) { return null; }
       });
-      buenos = verif.filter(x => x.keep).map(x => x.s);
+      buenos = verif.filter(Boolean);
+    } else {
+      // Sin token: caemos a lo que la foto marque como 2+
+      buenos = candidatos.filter(s => (s.unidades || 1) >= 2);
     }
 
     const lista = buenos.map(s => ({
       shipment_id: s.shipment_id, nro_venta: s.nro_venta, sku: s.sku, titulo: s.titulo,
-      unidades: s.unidades || 2, impresa: impSet.has(s.shipment_id),
+      unidades: s.unidades || 2, productos: s._nitems || 1, impresa: impSet.has(s.shipment_id),
       estado: s._st || s.status || '', sub: (s._sub != null ? s._sub : s.substatus) || ''
     }));
     lista.sort(ordenarPorSku);
@@ -1185,7 +1204,33 @@ async function colectasDelDia(token) {
   return colectas;
 }
 
-// ── DIAGNÓSTICO: ¿dónde está el transportista/patente de la colecta? ──
+// ── Refresco AUTOMÁTICO de la colecta del día (no hace falta tocar ningún botón) ──
+// Hora Argentina: 00:30, 08:00 y cada hora de 06 a 13. Mantiene los datos frescos
+// en el servidor; cuando entrás a Despachar ya están listos al instante.
+function horaART() {
+  const art = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires' }));
+  return { h: art.getHours(), m: art.getMinutes(), dia: art.toDateString() };
+}
+let _ultRefrescoColecta = '';
+setInterval(async () => {
+  try {
+    const { h, m, dia } = horaART();
+    const enVentana =
+      (h === 0 && m >= 30 && m < 40) ||   // 00:30
+      (h === 8 && m < 10) ||              // 08:00
+      (h >= 6 && h <= 13 && m < 10);      // cada hora de 06 a 13
+    if (!enVentana) return;
+    const clave = `${dia}-${h}`;
+    if (_ultRefrescoColecta === clave) return;  // ya se refrescó en esta hora
+    _ultRefrescoColecta = clave;
+    const token = await getValidToken(ML_USER_ID);
+    if (!token) return;
+    _colectasCache = { at: 0, colectas: [] };   // invalidar y volver a pedir a ML
+    const cols = await colectasDelDia(token);
+    console.log(`[COLECTAS] refresco automático ${h}:00 ART · ${cols.filter(c => c.tanda === 'colecta').length} colecta(s)`);
+  } catch (e) { console.error('[COLECTAS-CRON]', e.message); }
+}, 5 * 60 * 1000);  // revisa cada 5 minutos si toca refrescar
+
 // /api/despacho/diag-camion?clave=pontec2026  (opcional &ship=SHIPMENT_ID)
 app.get('/api/despacho/diag-camion', async (req, res) => {
   if ((req.query.clave || '') !== 'pontec2026')
@@ -2256,7 +2301,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.19-quien-cargo' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.20-multiproducto-cron' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

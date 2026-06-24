@@ -292,10 +292,12 @@ async function obtenerShipmentsDetallados(token, onLote) {
       s.logistic = ship.logistic_type || (ship.logistic && ship.logistic.type) || '';
       s.limite   = (ship.shipping_option && ship.shipping_option.estimated_handling_limit
                     && ship.shipping_option.estimated_handling_limit.date) || null;
+      s.pay_before = (ship.shipping_option && ship.shipping_option.estimated_delivery_time
+                    && ship.shipping_option.estimated_delivery_time.pay_before) || null;
       const sa = ship.sender_address || {};
       s.dep_id  = sa.id ? String(sa.id) : '';
       s.dep_dir = `${sa.address_line || ''} ${(sa.city && sa.city.name) || ''}`.trim();
-    } catch (e) { s.status = 'error'; s.logistic = ''; s.limite = null; s.dep_id = ''; s.dep_dir = ''; }
+    } catch (e) { s.status = 'error'; s.logistic = ''; s.limite = null; s.pay_before = null; s.dep_id = ''; s.dep_dir = ''; }
     return s;
   };
 
@@ -342,6 +344,7 @@ function filaEnvio(s) {
     status: s.status || null,
     substatus: s.substatus || null,
     limite: s.limite ? String(s.limite).substring(0,10) : null,
+    pay_before: s.pay_before || null,
     ciudad_depo: dir || null,
     es_nuestro: esNuestro,
     cancelada: s.status === 'cancelled',
@@ -365,6 +368,8 @@ async function actualizarFotoEnvio(shipmentId, token) {
       logistic: ship.logistic_type || (ship.logistic && ship.logistic.type) || '',
       limite: (ship.shipping_option && ship.shipping_option.estimated_handling_limit
                && ship.shipping_option.estimated_handling_limit.date) || null,
+      pay_before: (ship.shipping_option && ship.shipping_option.estimated_delivery_time
+               && ship.shipping_option.estimated_delivery_time.pay_before) || null,
     };
     const sa = ship.sender_address || {};
     s.dep_id = sa.id ? String(sa.id) : '';
@@ -754,7 +759,7 @@ app.get('/api/despacho/panel', async (_req, res) => {
     let envios = [], from = 0;
     while (true) {
       const { data, error } = await supabase.from('dep_envios')
-        .select('shipment_id,nro_venta,sku,titulo,unidades,tipo,status,substatus,limite,es_nuestro,cancelada,actualizado_at')
+        .select('shipment_id,nro_venta,sku,titulo,unidades,tipo,status,substatus,limite,pay_before,es_nuestro,cancelada,actualizado_at')
         .eq('es_nuestro', true).neq('tipo', 'full')
         .range(from, from + 999);
       if (error) throw new Error(error.message);
@@ -783,6 +788,9 @@ app.get('/api/despacho/panel', async (_req, res) => {
         unidades: s.unidades || 1, tipo: s.tipo, status: s.status, substatus: s.substatus,
         estado: ESTADO_ES[s.status] || s.status,
         limite: s.limite || null,
+        pay_before: s.pay_before || null,
+        // "hoy" si el corte de ML es hoy o ya pasó; "manana" si es a futuro. Sin dato → hoy.
+        cuando: (s.pay_before && String(s.pay_before).substring(0,10) > hoy) ? 'manana' : 'hoy',
         despachado_at: d ? d.despachado_at : null,
         colecta: d && d.colecta_carrier ? `${d.colecta_carrier}${d.colecta_patente ? ' · ' + d.colecta_patente : ''}` : null
       };
@@ -806,7 +814,11 @@ app.get('/api/despacho/panel', async (_req, res) => {
     const porImprimir = etapas.para_imprimir;
     const cont = {
       flex: porImprimir.filter(s => s.tipo === 'flex').length,
-      colecta: porImprimir.filter(s => s.tipo === 'colecta').length
+      colecta: porImprimir.filter(s => s.tipo === 'colecta').length,
+      flex_hoy: porImprimir.filter(s => s.tipo === 'flex' && s.cuando === 'hoy').length,
+      colecta_hoy: porImprimir.filter(s => s.tipo === 'colecta' && s.cuando === 'hoy').length,
+      flex_manana: porImprimir.filter(s => s.tipo === 'flex' && s.cuando === 'manana').length,
+      colecta_manana: porImprimir.filter(s => s.tipo === 'colecta' && s.cuando === 'manana').length
     };
 
     // ¿Cuándo se actualizó la foto por última vez?
@@ -2350,7 +2362,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.22-diag-fechadesp' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.23-corte-hoy-manana' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

@@ -946,11 +946,15 @@ app.get('/api/despacho/separables', async (_req, res) => {
           try { await supabase.from('dep_envios').update({ status: sh.status, substatus: sh.substatus || null, unidades: units }).eq('shipment_id', s.shipment_id); } catch (_) {}
           if (yaFue) return null;                 // ya salió
           if (units < 2 && nItems < 2) return null; // ni multi-unidad ni multi-producto
-          // Traer los SKUs de todos los productos de la venta (shipping_items no trae el SKU)
+          // Títulos de los productos del envío (ML siempre los da, aunque sin SKU)
+          const titulos = (sh.shipping_items || []).map(it => (it.description || '').trim()).filter(Boolean);
+          // SKUs de la orden (shipping_items no trae el SKU)
           let skus = [s.sku].filter(Boolean);
+          let packId = null;
           try {
             const ro = await fetch(`https://api.mercadolibre.com/orders/${s.nro_venta}?access_token=${token}`);
             const order = await ro.json();
+            packId = order && order.pack_id ? String(order.pack_id) : null;
             if (order && Array.isArray(order.order_items)) {
               const ss = order.order_items
                 .map(it => (it.item && (it.item.seller_sku || it.item.seller_custom_field)) || '')
@@ -958,7 +962,28 @@ app.get('/api/despacho/separables', async (_req, res) => {
               if (ss.length) skus = [...new Set(ss)];
             }
           } catch (_) {}
-          return { ...s, unidades: units, _nitems: nItems, _skus: skus, _st: sh.status, _sub: sh.substatus || '' };
+          // Si faltan SKUs (pack repartido en varias órdenes), los buscamos por el pack
+          if (skus.length < nItems && packId) {
+            try {
+              const rp = await fetch(`https://api.mercadolibre.com/packs/${packId}?access_token=${token}`);
+              if (rp.ok) {
+                const pack = await rp.json();
+                const oids = (pack.orders || []).map(o => o.id).filter(Boolean);
+                for (const oid of oids) {
+                  try {
+                    const r2 = await fetch(`https://api.mercadolibre.com/orders/${oid}?access_token=${token}`);
+                    const o2 = await r2.json();
+                    for (const it of (o2.order_items || [])) {
+                      const sk = (it.item && (it.item.seller_sku || it.item.seller_custom_field)) || '';
+                      if (sk) skus.push(String(sk).trim());
+                    }
+                  } catch (_) {}
+                }
+                skus = [...new Set(skus.filter(Boolean))];
+              }
+            } catch (_) {}
+          }
+          return { ...s, unidades: units, _nitems: nItems, _skus: skus, _titulos: titulos, _st: sh.status, _sub: sh.substatus || '' };
         } catch (_) { return null; }
       });
       buenos = verif.filter(Boolean);
@@ -969,7 +994,8 @@ app.get('/api/despacho/separables', async (_req, res) => {
 
     const lista = buenos.map(s => ({
       shipment_id: s.shipment_id, nro_venta: s.nro_venta,
-      sku: s.sku, skus: (s._skus && s._skus.length ? s._skus : [s.sku].filter(Boolean)), titulo: s.titulo,
+      sku: s.sku, skus: (s._skus && s._skus.length ? s._skus : [s.sku].filter(Boolean)),
+      titulos: s._titulos || [], titulo: s.titulo,
       unidades: s.unidades || 2, productos: s._nitems || 1, impresa: impSet.has(s.shipment_id),
       estado: s._st || s.status || '', sub: (s._sub != null ? s._sub : s.substatus) || ''
     }));
@@ -2427,7 +2453,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.25-diag-skus-pack' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.26-skus-via-pack' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

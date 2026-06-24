@@ -1369,6 +1369,19 @@ app.get('/api/despacho/buscar', async (req, res) => {
       if (data && data[0]) { impreso = true; impreso_at = data[0].impreso_at; }
     }
 
+    // ¿Quién lo escaneó/despachó desde el sistema?
+    let escaneado_por = null, escaneado_at = null, destino_escaneo = null;
+    if (shipId) {
+      const { data } = await supabase.from('dep_despachos')
+        .select('usuario,despachado_at,destino_nombre').eq('shipment_id', String(shipId))
+        .order('despachado_at', { ascending: false }).limit(1);
+      if (data && data[0]) {
+        escaneado_por = data[0].usuario || null;
+        escaneado_at = data[0].despachado_at || null;
+        destino_escaneo = data[0].destino_nombre || null;
+      }
+    }
+
     res.json({
       nro_venta: String(order.id),
       shipment_id: shipId ? String(shipId) : null,
@@ -1377,7 +1390,8 @@ app.get('/api/despacho/buscar', async (req, res) => {
       estado, estado_codigo: estadoCodigo, substatus,
       despachado: ['shipped', 'delivered'].includes(estadoCodigo),
       entregado: estadoCodigo === 'delivered',
-      impreso, impreso_at
+      impreso, impreso_at,
+      escaneado_por, escaneado_at, destino_escaneo
     });
   } catch (e) {
     console.error('[BUSCAR]', e.message);
@@ -2242,7 +2256,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.18-colecta-horario' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.19-quien-cargo' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

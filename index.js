@@ -103,7 +103,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function requireAuth(req, res, next) {
   try {
     // Excepción temporal: diagnóstico accesible con clave en la URL (para debug)
-    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas' || req.path === '/diag-fechas' || req.path === '/diag-nodo' || req.path === '/diag-imprimir' || req.path === '/diag-camion' || req.path === '/diag-fechadesp') && (req.query.clave || '') === 'pontec2026') return next();
+    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas' || req.path === '/diag-fechas' || req.path === '/diag-nodo' || req.path === '/diag-imprimir' || req.path === '/diag-camion' || req.path === '/diag-fechadesp' || req.path === '/diag-skus') && (req.query.clave || '') === 'pontec2026') return next();
     const h = req.headers.authorization || '';
     const token = h.startsWith('Bearer ') ? h.slice(7) : '';
     if (!token) return res.status(401).json({ error: 'No autorizado' });
@@ -1256,6 +1256,39 @@ setInterval(async () => {
   } catch (e) { console.error('[COLECTAS-CRON]', e.message); }
 }, 5 * 60 * 1000);  // revisa cada 5 minutos si toca refrescar
 
+// ── DIAGNÓSTICO: ¿qué SKUs trae una venta/pack? ──
+// /api/despacho/diag-skus?clave=pontec2026&venta=NRO   (o &ship=ID)
+app.get('/api/despacho/diag-skus', async (req, res) => {
+  if ((req.query.clave || '') !== 'pontec2026') return res.status(401).json({ error: 'Agregá ?clave=pontec2026' });
+  try {
+    const token = await getValidToken(ML_USER_ID);
+    if (!token) throw new Error('No hay token de ML disponible');
+    const auth = { headers: { Authorization: `Bearer ${token}` } };
+    let venta = (req.query.venta || '').trim();
+    const ship = (req.query.ship || '').trim();
+    let shipJson = null;
+    if (ship) {
+      const rs = await fetch(`https://api.mercadolibre.com/shipments/${ship}`, auth);
+      shipJson = await rs.json();
+      venta = venta || shipJson.order_id || (Array.isArray(shipJson.order_ids) && shipJson.order_ids[0]);
+    }
+    const out = { venta, ship };
+    if (venta) {
+      const ro = await fetch(`https://api.mercadolibre.com/orders/${venta}?access_token=${token}`);
+      const order = await ro.json();
+      out.order_status = order.status;
+      out.order_items = (order.order_items || []).map(it => ({
+        seller_sku: it.item && it.item.seller_sku,
+        seller_custom_field: it.item && it.item.seller_custom_field,
+        title: it.item && it.item.title,
+        quantity: it.quantity
+      }));
+    }
+    if (shipJson) out.shipping_items = (shipJson.shipping_items || []).map(it => ({ description: it.description, quantity: it.quantity }));
+    res.json(out);
+  } catch (e) { console.error('[DIAG-SKUS]', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // ── DIAGNÓSTICO: ¿qué campo trae la fecha de "Despachar: <día>"? ──
 // /api/despacho/diag-fechadesp?clave=pontec2026  (opcional &ship=ID)
 app.get('/api/despacho/diag-fechadesp', async (req, res) => {
@@ -2362,7 +2395,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.23-corte-hoy-manana' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.24-diag-skus' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

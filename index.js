@@ -103,7 +103,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function requireAuth(req, res, next) {
   try {
     // Excepción temporal: diagnóstico accesible con clave en la URL (para debug)
-    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas' || req.path === '/diag-fechas' || req.path === '/diag-nodo' || req.path === '/diag-imprimir' || req.path === '/diag-camion') && (req.query.clave || '') === 'pontec2026') return next();
+    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas' || req.path === '/diag-fechas' || req.path === '/diag-nodo' || req.path === '/diag-imprimir' || req.path === '/diag-camion' || req.path === '/diag-fechadesp') && (req.query.clave || '') === 'pontec2026') return next();
     const h = req.headers.authorization || '';
     const token = h.startsWith('Bearer ') ? h.slice(7) : '';
     if (!token) return res.status(401).json({ error: 'No autorizado' });
@@ -1244,6 +1244,42 @@ setInterval(async () => {
   } catch (e) { console.error('[COLECTAS-CRON]', e.message); }
 }, 5 * 60 * 1000);  // revisa cada 5 minutos si toca refrescar
 
+// ── DIAGNÓSTICO: ¿qué campo trae la fecha de "Despachar: <día>"? ──
+// /api/despacho/diag-fechadesp?clave=pontec2026  (opcional &ship=ID)
+app.get('/api/despacho/diag-fechadesp', async (req, res) => {
+  if ((req.query.clave || '') !== 'pontec2026') return res.status(401).json({ error: 'Agregá ?clave=pontec2026' });
+  try {
+    const token = await getValidToken(ML_USER_ID);
+    if (!token) throw new Error('No hay token de ML disponible');
+    const auth = { headers: { Authorization: `Bearer ${token}` } };
+    let shipId = (req.query.ship || '').trim();
+    if (!shipId) {
+      const { data } = await supabase.from('dep_envios')
+        .select('shipment_id,status').eq('es_nuestro', true).eq('tipo', 'colecta')
+        .eq('status', 'ready_to_ship').limit(1);
+      shipId = data && data[0] ? data[0].shipment_id : '';
+    }
+    if (!shipId) throw new Error('No encontré un envío de colecta para mirar');
+    const r = await fetch(`https://api.mercadolibre.com/shipments/${shipId}`, auth);
+    const sh = await r.json();
+    const so = sh.shipping_option || {};
+    res.json({
+      shipment_id: shipId,
+      status: sh.status, substatus: sh.substatus,
+      date_created: sh.date_created,
+      date_first_printed: sh.date_first_printed,
+      shipping_option_fechas: {
+        estimated_handling_limit: so.estimated_handling_limit,
+        estimated_delivery_limit: so.estimated_delivery_limit,
+        estimated_delivery_time: so.estimated_delivery_time,
+        pickup_promise: so.pickup_promise,
+        buffering: so.buffering
+      },
+      status_history: sh.status_history
+    });
+  } catch (e) { console.error('[DIAG-FECHADESP]', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // /api/despacho/diag-camion?clave=pontec2026  (opcional &ship=SHIPMENT_ID)
 app.get('/api/despacho/diag-camion', async (req, res) => {
   if ((req.query.clave || '') !== 'pontec2026')
@@ -2314,7 +2350,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.21-skus-pack' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.22-diag-fechadesp' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

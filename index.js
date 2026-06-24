@@ -1779,6 +1779,33 @@ app.post('/api/despacho/camiones', async (req, res) => {
   } catch (e) { console.error('[CAMIONES]', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// Editar un camión (patente / chofer-descripción)
+app.post('/api/despacho/camiones/editar', async (req, res) => {
+  try {
+    const id = (req.body && req.body.id) || null;
+    const patente = ((req.body && req.body.patente) || '').trim().toUpperCase();
+    const descripcion = ((req.body && req.body.descripcion) || '').trim();
+    if (!id) return res.status(400).json({ error: 'Falta el id' });
+    if (!patente) return res.status(400).json({ error: 'Falta la patente' });
+    const { data, error } = await supabase.from('dep_camiones')
+      .update({ patente, descripcion }).eq('id', id)
+      .select('id,patente,descripcion,activo').limit(1);
+    if (error) throw new Error(error.message);
+    res.json({ camion: (data && data[0]) || null });
+  } catch (e) { console.error('[CAMIONES-EDIT]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Borrar un camión (baja lógica: activo=false; no afecta el historial ya guardado)
+app.post('/api/despacho/camiones/borrar', async (req, res) => {
+  try {
+    const id = (req.body && req.body.id) || null;
+    if (!id) return res.status(400).json({ error: 'Falta el id' });
+    const { error } = await supabase.from('dep_camiones').update({ activo: false }).eq('id', id);
+    if (error) throw new Error(error.message);
+    res.json({ ok: true });
+  } catch (e) { console.error('[CAMIONES-DEL]', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // ── Destinos del día: abiertos + opciones para abrir ──────────────
 app.get('/api/despacho/destinos', async (_req, res) => {
   try {
@@ -2209,7 +2236,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.16-diag-camion' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.17-config-camiones' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

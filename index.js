@@ -103,7 +103,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function requireAuth(req, res, next) {
   try {
     // Excepción temporal: diagnóstico accesible con clave en la URL (para debug)
-    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas' || req.path === '/diag-fechas' || req.path === '/diag-nodo' || req.path === '/diag-imprimir' || req.path === '/diag-camion' || req.path === '/diag-fechadesp' || req.path === '/diag-skus') && (req.query.clave || '') === 'pontec2026') return next();
+    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas' || req.path === '/diag-fechas' || req.path === '/diag-nodo' || req.path === '/diag-imprimir' || req.path === '/diag-camion' || req.path === '/diag-fechadesp' || req.path === '/diag-skus' || req.path === '/diag-cancel') && (req.query.clave || '') === 'pontec2026') return next();
     const h = req.headers.authorization || '';
     const token = h.startsWith('Bearer ') ? h.slice(7) : '';
     if (!token) return res.status(401).json({ error: 'No autorizado' });
@@ -1306,6 +1306,38 @@ async function colectasDelDia(token) {
   _colectasCache = { at: Date.now(), colectas };
   return colectas;
 }
+
+// ── DIAGNÓSTICO: ¿cómo viene una venta cancelada? (orden vs envío) ──
+// /api/despacho/diag-cancel?clave=pontec2026&venta=NRO
+app.get('/api/despacho/diag-cancel', async (req, res) => {
+  if ((req.query.clave || '') !== 'pontec2026') return res.status(401).json({ error: 'Agregá ?clave=pontec2026' });
+  try {
+    const token = await getValidToken(ML_USER_ID);
+    if (!token) throw new Error('No hay token de ML disponible');
+    const auth = { headers: { Authorization: `Bearer ${token}` } };
+    const venta = (req.query.venta || '').trim();
+    if (!venta) throw new Error('Pasá ?venta=NRO');
+    const out = { venta };
+    // Orden
+    try {
+      const ro = await fetch(`https://api.mercadolibre.com/orders/${venta}?access_token=${token}`);
+      const o = await ro.json();
+      out.order = { status: o.status, status_detail: o.status_detail, cancel_detail: o.cancel_detail, shipping_id: o.shipping && o.shipping.id };
+      const shipId = o.shipping && o.shipping.id;
+      if (shipId) {
+        const rs = await fetch(`https://api.mercadolibre.com/shipments/${shipId}`, auth);
+        const sh = await rs.json();
+        out.shipment = { id: shipId, status: sh.status, substatus: sh.substatus };
+      }
+    } catch (e) { out.err = e.message; }
+    // Lo que tenemos guardado en la foto
+    try {
+      const { data } = await supabase.from('dep_envios').select('shipment_id,nro_venta,tipo,status,substatus,cancelada,pay_before').eq('nro_venta', venta).limit(2);
+      out.foto = data;
+    } catch (_) {}
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // ── Refresco AUTOMÁTICO de la colecta del día (no hace falta tocar ningún botón) ──
 // Hora Argentina: 00:30, 08:00 y cada hora de 06 a 13. Mantiene los datos frescos
@@ -2586,7 +2618,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.35-corte-paybefore-dia' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.36-diag-cancel' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

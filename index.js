@@ -294,6 +294,7 @@ async function obtenerShipmentsDetallados(token, onLote) {
                     && ship.shipping_option.estimated_handling_limit.date) || null;
       s.pay_before = (ship.shipping_option && ship.shipping_option.estimated_delivery_time
                     && ship.shipping_option.estimated_delivery_time.pay_before) || null;
+      s.date_handling = (ship.status_history && ship.status_history.date_handling) || null;
       const sa = ship.sender_address || {};
       s.dep_id  = sa.id ? String(sa.id) : '';
       s.dep_dir = `${sa.address_line || ''} ${(sa.city && sa.city.name) || ''}`.trim();
@@ -345,6 +346,7 @@ function filaEnvio(s) {
     substatus: s.substatus || null,
     limite: s.limite ? String(s.limite).substring(0,10) : null,
     pay_before: s.pay_before || null,
+    date_handling: s.date_handling || null,
     ciudad_depo: dir || null,
     es_nuestro: esNuestro,
     cancelada: s.status === 'cancelled',
@@ -370,6 +372,7 @@ async function actualizarFotoEnvio(shipmentId, token) {
                && ship.shipping_option.estimated_handling_limit.date) || null,
       pay_before: (ship.shipping_option && ship.shipping_option.estimated_delivery_time
                && ship.shipping_option.estimated_delivery_time.pay_before) || null,
+      date_handling: (ship.status_history && ship.status_history.date_handling) || null,
     };
     const sa = ship.sender_address || {};
     s.dep_id = sa.id ? String(sa.id) : '';
@@ -743,6 +746,19 @@ app.get('/api/despacho/foto/estado', async (_req, res) => {
 
 // ── PANEL EN VIVO: lee la foto local (rápido, sin pegarle a ML) ────
 // Devuelve todo clasificado por etapa, listo para el panel.
+// Decide si un envío va HOY o MAÑANA.
+// Regla (confirmada con la operación): si la venta se liberó (date_handling) DESPUÉS
+// del corte (pay_before), va mañana —aunque el corte sea de hoy—. Si el corte es de un
+// día futuro, también va mañana. Si no, va hoy. Compara fecha + hora exacta.
+function cuandoDespacho(s, hoy) {
+  const pb = s.pay_before ? String(s.pay_before) : null;
+  if (pb && pb.substring(0, 10) > hoy) return 'manana';            // corte a futuro
+  if (pb && s.date_handling) {
+    if (new Date(s.date_handling).getTime() > new Date(pb).getTime()) return 'manana'; // entró pasado el corte
+  }
+  return 'hoy';
+}
+
 app.get('/api/despacho/panel', async (_req, res) => {
   try {
     // Estados despachados localmente (escaneados al cargar el camión)
@@ -759,7 +775,7 @@ app.get('/api/despacho/panel', async (_req, res) => {
     let envios = [], from = 0;
     while (true) {
       const { data, error } = await supabase.from('dep_envios')
-        .select('shipment_id,nro_venta,sku,titulo,unidades,tipo,status,substatus,limite,pay_before,es_nuestro,cancelada,actualizado_at')
+        .select('shipment_id,nro_venta,sku,titulo,unidades,tipo,status,substatus,limite,pay_before,date_handling,es_nuestro,cancelada,actualizado_at')
         .eq('es_nuestro', true).neq('tipo', 'full')
         .range(from, from + 999);
       if (error) throw new Error(error.message);
@@ -789,9 +805,9 @@ app.get('/api/despacho/panel', async (_req, res) => {
         estado: ESTADO_ES[s.status] || s.status,
         limite: s.limite || null,
         pay_before: s.pay_before || null,
-        // "hoy" si el corte de ML (pay_before) es hoy o ya pasó; "manana" si es a futuro.
-        // Vale para Flex y Colecta. Si falta el dato, se completa en vivo (ver más abajo).
-        cuando: (s.pay_before && String(s.pay_before).substring(0,10) > hoy) ? 'manana' : 'hoy',
+        date_handling: s.date_handling || null,
+        // "hoy" o "manana" según corte + hora de liberación (ver cuandoDespacho)
+        cuando: cuandoDespacho(s, hoy),
         despachado_at: d ? d.despachado_at : null,
         colecta: d && d.colecta_carrier ? `${d.colecta_carrier}${d.colecta_patente ? ' · ' + d.colecta_patente : ''}` : null
       };
@@ -814,9 +830,9 @@ app.get('/api/despacho/panel', async (_req, res) => {
     // Contadores por tanda de lo que está para imprimir
     const porImprimir = etapas.para_imprimir;
 
-    // Completar en vivo el pay_before que falte (envíos viejos sin el dato), así no
-    // caen en HOY por defecto. Consultamos ML solo para esos y corregimos la foto.
-    const sinPay = porImprimir.filter(s => !s.pay_before);
+    // Completar en vivo el corte/hora de liberación que falte (envíos viejos sin el dato),
+    // así no caen en HOY por defecto. Consultamos ML solo para esos y corregimos la foto.
+    const sinPay = porImprimir.filter(s => !s.pay_before || !s.date_handling);
     if (sinPay.length) {
       const tk = await getValidToken(ML_USER_ID);
       if (tk) {
@@ -828,10 +844,12 @@ app.get('/api/despacho/panel', async (_req, res) => {
             const sh = await r.json();
             const pb = (sh.shipping_option && sh.shipping_option.estimated_delivery_time
                         && sh.shipping_option.estimated_delivery_time.pay_before) || null;
-            if (pb) {
-              s.pay_before = pb;
-              s.cuando = String(pb).substring(0, 10) > hoy ? 'manana' : 'hoy';
-              try { await supabase.from('dep_envios').update({ pay_before: pb }).eq('shipment_id', s.shipment_id); } catch (_) {}
+            const dh = (sh.status_history && sh.status_history.date_handling) || null;
+            if (pb) s.pay_before = pb;
+            if (dh) s.date_handling = dh;
+            s.cuando = cuandoDespacho(s, hoy);
+            if (pb || dh) {
+              try { await supabase.from('dep_envios').update({ pay_before: pb || s.pay_before, date_handling: dh || s.date_handling }).eq('shipment_id', s.shipment_id); } catch (_) {}
             }
           } catch (_) {}
         });
@@ -2485,7 +2503,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.29-paybefore-vivo' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.30-corte-hora-exacta' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

@@ -747,15 +747,13 @@ app.get('/api/despacho/foto/estado', async (_req, res) => {
 // ── PANEL EN VIVO: lee la foto local (rápido, sin pegarle a ML) ────
 // Devuelve todo clasificado por etapa, listo para el panel.
 // Decide si un envío va HOY o MAÑANA.
-// Regla (confirmada con la operación): si la venta se liberó (date_handling) DESPUÉS
-// del corte (pay_before), va mañana —aunque el corte sea de hoy—. Si el corte es de un
-// día futuro, también va mañana. Si no, va hoy. Compara fecha + hora exacta.
+// Confiamos en el pay_before de ML, que ya trae el DÍA de despacho decidido:
+//  - Flex vendido pasado el mediodía → ML deja pay_before hoy → HOY (entrega same-day).
+//  - Colecta vendida pasado el corte → ML mueve pay_before a mañana → MAÑANA.
+// Regla: si el día del pay_before es futuro → mañana; si es hoy o anterior (o no hay dato) → hoy.
 function cuandoDespacho(s, hoy) {
-  const pb = s.pay_before ? String(s.pay_before) : null;
-  if (pb && pb.substring(0, 10) > hoy) return 'manana';            // corte a futuro
-  if (pb && s.date_handling) {
-    if (new Date(s.date_handling).getTime() > new Date(pb).getTime()) return 'manana'; // entró pasado el corte
-  }
+  const pb = s.pay_before ? String(s.pay_before).substring(0, 10) : null;
+  if (pb && pb > hoy) return 'manana';
   return 'hoy';
 }
 
@@ -2588,7 +2586,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.34-faltan-verifica' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.35-corte-paybefore-dia' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

@@ -1356,13 +1356,19 @@ app.get('/api/despacho/diag-fechadesp', async (req, res) => {
     if (!token) throw new Error('No hay token de ML disponible');
     const auth = { headers: { Authorization: `Bearer ${token}` } };
     let shipId = (req.query.ship || '').trim();
+    const venta = (req.query.venta || '').trim();
+    if (!shipId && venta) {
+      const ro = await fetch(`https://api.mercadolibre.com/orders/${venta}?access_token=${token}`);
+      const ord = await ro.json();
+      shipId = ord.shipping && ord.shipping.id ? String(ord.shipping.id) : '';
+    }
     if (!shipId) {
       const { data } = await supabase.from('dep_envios')
         .select('shipment_id,status').eq('es_nuestro', true).eq('tipo', 'colecta')
         .eq('status', 'ready_to_ship').limit(1);
       shipId = data && data[0] ? data[0].shipment_id : '';
     }
-    if (!shipId) throw new Error('No encontré un envío de colecta para mirar');
+    if (!shipId) throw new Error('No encontré un envío para mirar');
     const r = await fetch(`https://api.mercadolibre.com/shipments/${shipId}`, auth);
     const sh = await r.json();
     const so = sh.shipping_option || {};
@@ -2453,7 +2459,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.26-skus-via-pack' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.27-diag-fecha-venta' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

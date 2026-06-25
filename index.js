@@ -1594,8 +1594,32 @@ app.get('/api/despacho/buscar', async (req, res) => {
     const token = await getValidToken(ML_USER_ID);
     if (!token) throw new Error('No hay token de ML disponible');
 
-    const ro = await fetch(`https://api.mercadolibre.com/orders/${venta}?access_token=${token}`);
-    const order = await ro.json();
+    // El código puede ser nro de venta, shipment_id (del QR) o pack. Lo resolvemos a la orden.
+    let ventaId = venta;
+    let ro = await fetch(`https://api.mercadolibre.com/orders/${ventaId}?access_token=${token}`);
+    let order = await ro.json();
+    if (order.error || !order.id) {
+      // ¿Está en la foto como shipment_id / nro_venta?
+      try {
+        const { data } = await supabase.from('dep_envios')
+          .select('nro_venta,shipment_id').or(`shipment_id.eq.${venta},nro_venta.eq.${venta}`).limit(1);
+        if (data && data[0] && data[0].nro_venta && data[0].nro_venta !== venta) {
+          ventaId = data[0].nro_venta;
+          order = await (await fetch(`https://api.mercadolibre.com/orders/${ventaId}?access_token=${token}`)).json();
+        }
+      } catch (_) {}
+    }
+    if (order.error || !order.id) {
+      // ¿Es un shipment_id? Lo resolvemos a su orden vía ML.
+      try {
+        const rs = await fetch(`https://api.mercadolibre.com/shipments/${venta}`, { headers: { Authorization: `Bearer ${token}` } });
+        if (rs.ok) {
+          const sh = await rs.json();
+          const oid = sh.order_id || (Array.isArray(sh.order_ids) && sh.order_ids[0]);
+          if (oid) { ventaId = String(oid); order = await (await fetch(`https://api.mercadolibre.com/orders/${ventaId}?access_token=${token}`)).json(); }
+        }
+      } catch (_) {}
+    }
     if (order.error || !order.id) {
       return res.status(404).json({ error: 'No encontré esa venta. Revisá el número.' });
     }
@@ -2513,7 +2537,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.31-desglose-productos' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.32-buscar-resuelve-scan' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

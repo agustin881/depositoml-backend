@@ -2018,18 +2018,44 @@ app.get('/api/despacho/despachados', async (_req, res) => {
     const impUnicas = new Map();
     for (const r of (imp || [])) if (!impUnicas.has(r.shipment_id)) impUnicas.set(r.shipment_id, r);
 
+    // ── "A despachar" del día = foto (estado real ML), del tipo, NO terminadas,
+    //    con pay_before HOY o anterior (hoy + demoradas). Cuenta por paquete.
+    //    Reconoce lo impreso en ML (no depende de que lo hayas impreso en el sistema).
+    let foto = [], from = 0;
+    while (true) {
+      const { data, error: e2 } = await supabase.from('dep_envios')
+        .select('shipment_id,nro_venta,sku,titulo,tipo,status,substatus,pay_before,cancelada')
+        .eq('es_nuestro', true).in('tipo', ['flex', 'colecta'])
+        .range(from, from + 999);
+      if (e2) throw new Error(e2.message);
+      if (!data || !data.length) break;
+      foto = foto.concat(data);
+      if (data.length < 1000) break;
+      from += 1000;
+    }
+    const TERMINADOS = ['shipped', 'delivered', 'not_delivered', 'returned', 'cancelled'];
+    const EN_RED = new Set(['in_hub', 'in_warehouse', 'on_route', 'in_route', 'out_for_delivery',
+      'soon_deliver', 'delivering', 'arrived', 'picked_up', 'dispatched']);
+    const hoy = fechaHoyART();
     const despIds = new Set((desp || []).map(r => r.shipment_id));
-    const faltan = Array.from(impUnicas.values())
-      .filter(r => !despIds.has(r.shipment_id))
-      .sort(ordenarPorSku);
 
-    // Desglose por tipo (Colecta / Flex): impresas, escaneadas y pendientes
-    const porTipo = { flex: { impresas: 0, escaneadas: 0 }, colecta: { impresas: 0, escaneadas: 0 } };
-    for (const r of impUnicas.values()) { if (porTipo[r.tipo]) porTipo[r.tipo].impresas++; }
+    const aDespachar = [];
+    for (const s of foto) {
+      if (s.cancelada || TERMINADOS.includes(s.status) || EN_RED.has(s.substatus)) continue; // ya salió
+      const pbDay = s.pay_before ? String(s.pay_before).substring(0, 10) : null;
+      if (pbDay && pbDay > hoy) continue;   // es para mañana/futuro → no es del día
+      aDespachar.push(s);
+    }
+    // Faltan = del día a despachar que todavía NO escaneamos
+    const faltan = aDespachar.filter(s => !despIds.has(s.shipment_id)).sort(ordenarPorSku);
+
+    // Desglose por tipo: total a despachar, escaneadas (hoy) y faltan
+    const porTipo = { flex: { total: 0, escaneadas: 0, pendientes: 0 }, colecta: { total: 0, escaneadas: 0, pendientes: 0 } };
+    for (const s of aDespachar) { if (porTipo[s.tipo]) porTipo[s.tipo].total++; }
     const despUnicas = new Map();
     for (const r of (desp || [])) if (!despUnicas.has(r.shipment_id)) despUnicas.set(r.shipment_id, r);
     for (const r of despUnicas.values()) { if (porTipo[r.tipo]) porTipo[r.tipo].escaneadas++; }
-    for (const t of ['flex', 'colecta']) porTipo[t].pendientes = Math.max(0, porTipo[t].impresas - porTipo[t].escaneadas);
+    for (const s of faltan) { if (porTipo[s.tipo]) porTipo[s.tipo].pendientes++; }
 
     res.json({
       impresas_hoy: impUnicas.size,
@@ -2537,7 +2563,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.32-buscar-resuelve-scan' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.33-faltan-real' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

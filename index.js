@@ -789,7 +789,8 @@ app.get('/api/despacho/panel', async (_req, res) => {
         estado: ESTADO_ES[s.status] || s.status,
         limite: s.limite || null,
         pay_before: s.pay_before || null,
-        // "hoy" si el corte de ML es hoy o ya pasó; "manana" si es a futuro. Sin dato → hoy.
+        // "hoy" si el corte de ML (pay_before) es hoy o ya pasó; "manana" si es a futuro.
+        // Vale para Flex y Colecta. Si falta el dato, se completa en vivo (ver más abajo).
         cuando: (s.pay_before && String(s.pay_before).substring(0,10) > hoy) ? 'manana' : 'hoy',
         despachado_at: d ? d.despachado_at : null,
         colecta: d && d.colecta_carrier ? `${d.colecta_carrier}${d.colecta_patente ? ' · ' + d.colecta_patente : ''}` : null
@@ -812,6 +813,31 @@ app.get('/api/despacho/panel', async (_req, res) => {
 
     // Contadores por tanda de lo que está para imprimir
     const porImprimir = etapas.para_imprimir;
+
+    // Completar en vivo el pay_before que falte (envíos viejos sin el dato), así no
+    // caen en HOY por defecto. Consultamos ML solo para esos y corregimos la foto.
+    const sinPay = porImprimir.filter(s => !s.pay_before);
+    if (sinPay.length) {
+      const tk = await getValidToken(ML_USER_ID);
+      if (tk) {
+        const auth = { headers: { Authorization: `Bearer ${tk}` } };
+        await poolMap(sinPay.slice(0, 100), 6, async (s) => {
+          try {
+            const r = await fetch(`https://api.mercadolibre.com/shipments/${s.shipment_id}`, auth);
+            if (!r.ok) return;
+            const sh = await r.json();
+            const pb = (sh.shipping_option && sh.shipping_option.estimated_delivery_time
+                        && sh.shipping_option.estimated_delivery_time.pay_before) || null;
+            if (pb) {
+              s.pay_before = pb;
+              s.cuando = String(pb).substring(0, 10) > hoy ? 'manana' : 'hoy';
+              try { await supabase.from('dep_envios').update({ pay_before: pb }).eq('shipment_id', s.shipment_id); } catch (_) {}
+            }
+          } catch (_) {}
+        });
+      }
+    }
+
     const cont = {
       flex: porImprimir.filter(s => s.tipo === 'flex').length,
       colecta: porImprimir.filter(s => s.tipo === 'colecta').length,
@@ -2459,7 +2485,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.27-diag-fecha-venta' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.29-paybefore-vivo' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

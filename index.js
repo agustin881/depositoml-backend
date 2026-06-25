@@ -2039,13 +2039,38 @@ app.get('/api/despacho/despachados', async (_req, res) => {
     const hoy = fechaHoyART();
     const despIds = new Set((desp || []).map(r => r.shipment_id));
 
-    const aDespachar = [];
+    let aDespachar = [];
     for (const s of foto) {
       if (s.cancelada || TERMINADOS.includes(s.status) || EN_RED.has(s.substatus)) continue; // ya salió
       const pbDay = s.pay_before ? String(s.pay_before).substring(0, 10) : null;
       if (pbDay && pbDay > hoy) continue;   // es para mañana/futuro → no es del día
       aDespachar.push(s);
     }
+
+    // Verificación en vivo (mismo criterio que Imprimir): las que NO escaneamos todavía
+    // las chequeamos contra ML para no contar canceladas/ya-salidas que el webhook no actualizó.
+    // De paso autocorregimos la foto para que la próxima ya esté bien.
+    const token = await getValidToken(ML_USER_ID);
+    if (token) {
+      const auth = { headers: { Authorization: `Bearer ${token}` } };
+      const aChequear = aDespachar.filter(s => !despIds.has(s.shipment_id)).slice(0, 160);
+      const fuera = new Set();
+      await poolMap(aChequear, 6, async (s) => {
+        try {
+          const r = await fetch(`https://api.mercadolibre.com/shipments/${s.shipment_id}`, auth);
+          if (!r.ok) return;
+          const sh = await r.json();
+          const cancel = sh.status === 'cancelled' || (sh.substatus === 'cancelled');
+          const yaSalio = TERMINADOS.includes(sh.status) || EN_RED.has(sh.substatus);
+          if (cancel || yaSalio) {
+            fuera.add(s.shipment_id);
+            try { await supabase.from('dep_envios').update({ status: sh.status, substatus: sh.substatus || null, cancelada: cancel }).eq('shipment_id', s.shipment_id); } catch (_) {}
+          }
+        } catch (_) {}
+      });
+      if (fuera.size) aDespachar = aDespachar.filter(s => !fuera.has(s.shipment_id));
+    }
+
     // Faltan = del día a despachar que todavía NO escaneamos
     const faltan = aDespachar.filter(s => !despIds.has(s.shipment_id)).sort(ordenarPorSku);
 
@@ -2563,7 +2588,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.33-faltan-real' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.34-faltan-verifica' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

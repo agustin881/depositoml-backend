@@ -103,7 +103,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function requireAuth(req, res, next) {
   try {
     // Excepción temporal: diagnóstico accesible con clave en la URL (para debug)
-    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas' || req.path === '/diag-fechas' || req.path === '/diag-nodo' || req.path === '/diag-imprimir' || req.path === '/diag-camion' || req.path === '/diag-fechadesp' || req.path === '/diag-skus' || req.path === '/diag-cancel' || req.path === '/diag-colcancel') && (req.query.clave || '') === 'pontec2026') return next();
+    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas' || req.path === '/diag-fechas' || req.path === '/diag-nodo' || req.path === '/diag-imprimir' || req.path === '/diag-camion' || req.path === '/diag-fechadesp' || req.path === '/diag-skus' || req.path === '/diag-cancel' || req.path === '/diag-colcancel' || req.path === '/diag-key') && (req.query.clave || '') === 'pontec2026') return next();
     const h = req.headers.authorization || '';
     const token = h.startsWith('Bearer ') ? h.slice(7) : '';
     if (!token) return res.status(401).json({ error: 'No autorizado' });
@@ -1306,6 +1306,34 @@ async function colectasDelDia(token) {
   _colectasCache = { at: Date.now(), colectas };
   return colectas;
 }
+
+// ── DIAGNÓSTICO: ¿la llave de servicio está bien? (no muestra la llave) ──
+// /api/despacho/diag-key?clave=pontec2026
+app.get('/api/despacho/diag-key', async (req, res) => {
+  if ((req.query.clave || '') !== 'pontec2026') return res.status(401).json({ error: 'Agregá ?clave=pontec2026' });
+  const k = process.env.SUPABASE_SERVICE_KEY || '';
+  // Detectar rol de la llave (las keys de Supabase son JWT: header.payload.firma)
+  let rol = 'desconocido';
+  try {
+    const payload = JSON.parse(Buffer.from(k.split('.')[1] || '', 'base64').toString('utf8'));
+    rol = payload.role || 'sin-rol';
+  } catch (_) { rol = 'no-es-jwt'; }
+  // Probar una escritura real en la tabla con RLS
+  let escritura = 'no probada';
+  try {
+    const { error } = await supabase.from('dep_codigo_autorizacion')
+      .upsert({ fecha: '1999-01-01', codigo: 'TEST', cargado_at: new Date().toISOString() }, { onConflict: 'fecha' });
+    escritura = error ? ('ERROR: ' + error.message) : 'OK ✅ (puede escribir)';
+    // limpiar el test
+    if (!error) await supabase.from('dep_codigo_autorizacion').delete().eq('fecha', '1999-01-01');
+  } catch (e) { escritura = 'ERROR: ' + e.message; }
+  res.json({
+    largo_llave: k.length,
+    tiene_salto_de_linea: /\s/.test(k.trim()) || k !== k.trim(),
+    rol_detectado: rol,            // debería ser "service_role"
+    prueba_de_escritura: escritura
+  });
+});
 
 // ── DIAGNÓSTICO: encontrar las canceladas que se cuelan en "a despachar" ──
 // /api/despacho/diag-colcancel?clave=pontec2026   (revisa colecta del día y marca canceladas reales)
@@ -2662,7 +2690,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.37-diag-colcancel' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.38-diag-key' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

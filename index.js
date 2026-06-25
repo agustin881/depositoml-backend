@@ -103,7 +103,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function requireAuth(req, res, next) {
   try {
     // Excepción temporal: diagnóstico accesible con clave en la URL (para debug)
-    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas' || req.path === '/diag-fechas' || req.path === '/diag-nodo' || req.path === '/diag-imprimir' || req.path === '/diag-camion' || req.path === '/diag-fechadesp' || req.path === '/diag-skus' || req.path === '/diag-cancel') && (req.query.clave || '') === 'pontec2026') return next();
+    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas' || req.path === '/diag-fechas' || req.path === '/diag-nodo' || req.path === '/diag-imprimir' || req.path === '/diag-camion' || req.path === '/diag-fechadesp' || req.path === '/diag-skus' || req.path === '/diag-cancel' || req.path === '/diag-colcancel') && (req.query.clave || '') === 'pontec2026') return next();
     const h = req.headers.authorization || '';
     const token = h.startsWith('Bearer ') ? h.slice(7) : '';
     if (!token) return res.status(401).json({ error: 'No autorizado' });
@@ -1306,6 +1306,50 @@ async function colectasDelDia(token) {
   _colectasCache = { at: Date.now(), colectas };
   return colectas;
 }
+
+// ── DIAGNÓSTICO: encontrar las canceladas que se cuelan en "a despachar" ──
+// /api/despacho/diag-colcancel?clave=pontec2026   (revisa colecta del día y marca canceladas reales)
+app.get('/api/despacho/diag-colcancel', async (req, res) => {
+  if ((req.query.clave || '') !== 'pontec2026') return res.status(401).json({ error: 'Agregá ?clave=pontec2026' });
+  try {
+    const token = await getValidToken(ML_USER_ID);
+    if (!token) throw new Error('No hay token');
+    const auth = { headers: { Authorization: `Bearer ${token}` } };
+    const TERMINADOS = ['shipped', 'delivered', 'not_delivered', 'returned', 'cancelled'];
+    const EN_RED = new Set(['in_hub', 'in_warehouse', 'on_route', 'in_route', 'out_for_delivery', 'soon_deliver', 'delivering', 'arrived', 'picked_up', 'dispatched']);
+    const hoy = fechaHoyART();
+    let foto = [], from = 0;
+    while (true) {
+      const { data } = await supabase.from('dep_envios')
+        .select('shipment_id,nro_venta,sku,tipo,status,substatus,pay_before,cancelada')
+        .eq('es_nuestro', true).eq('tipo', (req.query.tipo || 'colecta'))
+        .range(from, from + 999);
+      if (!data || !data.length) break; foto = foto.concat(data);
+      if (data.length < 1000) break; from += 1000;
+    }
+    const cand = foto.filter(s => {
+      if (s.cancelada || TERMINADOS.includes(s.status) || EN_RED.has(s.substatus)) return false;
+      const pb = s.pay_before ? String(s.pay_before).substring(0, 10) : null;
+      if (pb && pb > hoy) return false;
+      return true;
+    });
+    const problemas = [];
+    await poolMap(cand.slice(0, 200), 6, async (s) => {
+      try {
+        const ro = await fetch(`https://api.mercadolibre.com/orders/${s.nro_venta}?access_token=${token}`);
+        const o = await ro.json();
+        const rs = await fetch(`https://api.mercadolibre.com/shipments/${s.shipment_id}`, auth);
+        const sh = await rs.json();
+        const ordenCancel = o.status === 'cancelled';
+        const envioFuera = TERMINADOS.includes(sh.status) || EN_RED.has(sh.substatus);
+        if (ordenCancel || envioFuera) {
+          problemas.push({ nro_venta: s.nro_venta, sku: s.sku, order_status: o.status, ship_status: sh.status, ship_substatus: sh.substatus });
+        }
+      } catch (_) {}
+    });
+    res.json({ candidatas: cand.length, se_cuelan: problemas.length, problemas });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // ── DIAGNÓSTICO: ¿cómo viene una venta cancelada? (orden vs envío) ──
 // /api/despacho/diag-cancel?clave=pontec2026&venta=NRO
@@ -2618,7 +2662,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.36-diag-cancel' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.37-diag-colcancel' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

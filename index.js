@@ -990,24 +990,30 @@ app.get('/api/despacho/separables', async (_req, res) => {
           try { await supabase.from('dep_envios').update({ status: sh.status, substatus: sh.substatus || null, unidades: units }).eq('shipment_id', s.shipment_id); } catch (_) {}
           if (yaFue) return null;                 // ya salió
           if (units < 2 && nItems < 2) return null; // ni multi-unidad ni multi-producto
-          // Títulos de los productos del envío (ML siempre los da, aunque sin SKU)
-          const titulos = (sh.shipping_items || []).map(it => (it.description || '').trim()).filter(Boolean);
-          // SKUs de la orden (shipping_items no trae el SKU)
-          let skus = [s.sku].filter(Boolean);
+          // Títulos + cantidades de los productos del envío (ML siempre los da)
+          const shipItems = (sh.shipping_items || []).map(it => ({
+            title: (it.description || '').trim(), quantity: it.quantity || 1
+          }));
+          const titulos = shipItems.map(it => it.title).filter(Boolean);
+          // Juntamos SKU + título desde las órdenes (para emparejar el SKU por título)
+          const prodInfo = [];   // [{sku, title}]
+          let skus = [];
           let packId = null;
+          const addFromOrder = (order) => {
+            for (const it of (order.order_items || [])) {
+              const sk = (it.item && (it.item.seller_sku || it.item.seller_custom_field)) || '';
+              const ti = (it.item && it.item.title) || '';
+              if (sk) { skus.push(String(sk).trim()); prodInfo.push({ sku: String(sk).trim(), title: ti.trim() }); }
+            }
+          };
           try {
             const ro = await fetch(`https://api.mercadolibre.com/orders/${s.nro_venta}?access_token=${token}`);
             const order = await ro.json();
             packId = order && order.pack_id ? String(order.pack_id) : null;
-            if (order && Array.isArray(order.order_items)) {
-              const ss = order.order_items
-                .map(it => (it.item && (it.item.seller_sku || it.item.seller_custom_field)) || '')
-                .map(x => String(x).trim()).filter(Boolean);
-              if (ss.length) skus = [...new Set(ss)];
-            }
+            addFromOrder(order);
           } catch (_) {}
           // Si faltan SKUs (pack repartido en varias órdenes), los buscamos por el pack
-          if (skus.length < nItems && packId) {
+          if (prodInfo.length < nItems && packId) {
             try {
               const rp = await fetch(`https://api.mercadolibre.com/packs/${packId}?access_token=${token}`);
               if (rp.ok) {
@@ -1016,18 +1022,22 @@ app.get('/api/despacho/separables', async (_req, res) => {
                 for (const oid of oids) {
                   try {
                     const r2 = await fetch(`https://api.mercadolibre.com/orders/${oid}?access_token=${token}`);
-                    const o2 = await r2.json();
-                    for (const it of (o2.order_items || [])) {
-                      const sk = (it.item && (it.item.seller_sku || it.item.seller_custom_field)) || '';
-                      if (sk) skus.push(String(sk).trim());
-                    }
+                    addFromOrder(await r2.json());
                   } catch (_) {}
                 }
-                skus = [...new Set(skus.filter(Boolean))];
               }
             } catch (_) {}
           }
-          return { ...s, unidades: units, _nitems: nItems, _skus: skus, _titulos: titulos, _st: sh.status, _sub: sh.substatus || '' };
+          if (!skus.length) skus = [s.sku].filter(Boolean);
+          skus = [...new Set(skus.filter(Boolean))];
+          // Detalle final: por cada producto del envío (título+cantidad), le pegamos el SKU si lo encontramos por título
+          const norm = t => (t || '').toLowerCase().replace(/\s+/g, ' ').trim();
+          const items = shipItems.map(si => {
+            const m = prodInfo.find(p => norm(p.title) === norm(si.title))
+                   || prodInfo.find(p => p.title && si.title && (norm(p.title).includes(norm(si.title)) || norm(si.title).includes(norm(p.title))));
+            return { sku: m ? m.sku : (shipItems.length === 1 && skus.length === 1 ? skus[0] : ''), title: si.title, quantity: si.quantity };
+          });
+          return { ...s, unidades: units, _nitems: nItems, _skus: skus, _titulos: titulos, _items: items, _st: sh.status, _sub: sh.substatus || '' };
         } catch (_) { return null; }
       });
       buenos = verif.filter(Boolean);
@@ -1039,7 +1049,7 @@ app.get('/api/despacho/separables', async (_req, res) => {
     const lista = buenos.map(s => ({
       shipment_id: s.shipment_id, nro_venta: s.nro_venta,
       sku: s.sku, skus: (s._skus && s._skus.length ? s._skus : [s.sku].filter(Boolean)),
-      titulos: s._titulos || [], titulo: s.titulo,
+      titulos: s._titulos || [], titulo: s.titulo, items: s._items || [],
       unidades: s.unidades || 2, productos: s._nitems || 1, impresa: impSet.has(s.shipment_id),
       estado: s._st || s.status || '', sub: (s._sub != null ? s._sub : s.substatus) || ''
     }));
@@ -2503,7 +2513,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.30-corte-hora-exacta' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.31-desglose-productos' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

@@ -747,14 +747,42 @@ app.get('/api/despacho/foto/estado', async (_req, res) => {
 // ── PANEL EN VIVO: lee la foto local (rápido, sin pegarle a ML) ────
 // Devuelve todo clasificado por etapa, listo para el panel.
 // Decide si un envío va HOY o MAÑANA.
-// Confiamos en el pay_before de ML, que ya trae el DÍA de despacho decidido:
-//  - Flex vendido pasado el mediodía → ML deja pay_before hoy → HOY (entrega same-day).
-//  - Colecta vendida pasado el corte → ML mueve pay_before a mañana → MAÑANA.
-// Regla: si el día del pay_before es futuro → mañana; si es hoy o anterior (o no hay dato) → hoy.
-function cuandoDespacho(s, hoy) {
+//  - pay_before futuro → MAÑANA.
+//  - pay_before de HOY → HOY.
+//  - pay_before VIEJO (anterior a hoy) y la venta se liberó HOY (date_handling):
+//      · Solo COLECTA: comparo la hora de liberación contra el corte de la última colecta de hoy.
+//        liberó antes del corte → HOY; liberó después → MAÑANA.
+//      · FLEX: no aplica corte de colecta → HOY.
+// corteHoyART: { fecha:'YYYY-MM-DD', corte:'HH:MM' } de la última colecta de hoy (o null).
+function cuandoDespacho(s, hoy, corteCol) {
   const pb = s.pay_before ? String(s.pay_before).substring(0, 10) : null;
-  if (pb && pb > hoy) return 'manana';
+  if (pb && pb > hoy) return 'manana';        // corte a futuro
+  if (pb && pb === hoy) return 'hoy';          // corte de hoy
+  // pay_before viejo (anterior a hoy) o sin dato:
+  if (s.tipo === 'colecta' && corteCol && corteCol.corte && s.date_handling) {
+    const libDia = fechaDeART(s.date_handling);
+    if (libDia === hoy) {
+      const libHHMM = horaDeART(s.date_handling);   // 'HH:MM' en hora Argentina
+      // liberó después del corte de la última colecta → mañana
+      if (libHHMM && libHHMM > corteCol.corte) return 'manana';
+    }
+  }
   return 'hoy';
+}
+
+// Fecha 'YYYY-MM-DD' de un timestamp ISO en hora Argentina
+function fechaDeART(iso) {
+  try {
+    const d = new Date(iso);
+    return d.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' }); // YYYY-MM-DD
+  } catch (_) { return null; }
+}
+// Hora 'HH:MM' de un timestamp ISO en hora Argentina
+function horaDeART(iso) {
+  try {
+    const d = new Date(iso);
+    return d.toLocaleTimeString('en-GB', { timeZone: 'America/Argentina/Buenos_Aires', hour: '2-digit', minute: '2-digit' }); // HH:MM
+  } catch (_) { return null; }
 }
 
 app.get('/api/despacho/panel', async (_req, res) => {
@@ -784,6 +812,16 @@ app.get('/api/despacho/panel', async (_req, res) => {
     }
 
     const hoy = fechaHoyART();
+    // Corte de la última colecta de hoy (cutoff más tarde) para clasificar las de pay_before viejo.
+    let corteCol = null;
+    try {
+      const token0 = await getValidToken(ML_USER_ID);
+      if (token0) {
+        const cols = await colectasDelDia(token0);
+        const cortes = (cols || []).filter(c => c.tanda === 'colecta' && c.cutoff).map(c => c.cutoff).sort();
+        if (cortes.length) corteCol = { corte: cortes[cortes.length - 1] };
+      }
+    } catch (_) {}
     const esFuturo = s => s.limite && String(s.limite) > hoy;
     const imprimible = s => s.status === 'ready_to_ship' &&
       (s.substatus === 'ready_to_print' || s.substatus === 'ready_to_ship' || !s.substatus);
@@ -805,7 +843,7 @@ app.get('/api/despacho/panel', async (_req, res) => {
         pay_before: s.pay_before || null,
         date_handling: s.date_handling || null,
         // "hoy" o "manana" según corte + hora de liberación (ver cuandoDespacho)
-        cuando: cuandoDespacho(s, hoy),
+        cuando: cuandoDespacho(s, hoy, corteCol),
         despachado_at: d ? d.despachado_at : null,
         colecta: d && d.colecta_carrier ? `${d.colecta_carrier}${d.colecta_patente ? ' · ' + d.colecta_patente : ''}` : null
       };
@@ -845,7 +883,7 @@ app.get('/api/despacho/panel', async (_req, res) => {
             const dh = (sh.status_history && sh.status_history.date_handling) || null;
             if (pb) s.pay_before = pb;
             if (dh) s.date_handling = dh;
-            s.cuando = cuandoDespacho(s, hoy);
+            s.cuando = cuandoDespacho(s, hoy, corteCol);
             if (pb || dh) {
               try { await supabase.from('dep_envios').update({ pay_before: pb || s.pay_before, date_handling: dh || s.date_handling }).eq('shipment_id', s.shipment_id); } catch (_) {}
             }
@@ -2690,7 +2728,7 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.38-diag-key' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.39-corte-colecta-viejo' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

@@ -2728,7 +2728,160 @@ app.get('/api/despacho/diag', async (req, res) => {
 });
 
 // ── Salud ─────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.39-corte-colecta-viejo' }));
+// ══════════════════════════════════════════════════════════════════
+//  COLECTA FULL · registrar y verificar bultos/pallets de envíos a Full
+//  Tabla dep_full_items. Todo bajo /api/despacho → ya pasa por requireAuth.
+// ══════════════════════════════════════════════════════════════════
+
+// Extrae el id escaneable de un código (número de barras crudo o JSON del QR)
+function parseFullId(codigo) {
+  const c = String(codigo || '').trim();
+  if (c.startsWith('{')) {
+    try { const j = JSON.parse(c); if (j && j.id) return String(j.id); } catch (e) {}
+  }
+  const m = c.match(/\d{6,}/);
+  return m ? m[0] : '';
+}
+
+// Trae todas las filas (paginado por el tope de 1000 de PostgREST)
+async function fetchAllFull(envio) {
+  let out = [], from = 0; const size = 1000;
+  for (;;) {
+    let q = supabase.from('dep_full_items')
+      .select('id,envio,reference_id,tipo,etiqueta,escaneado_at,registrado_at')
+      .range(from, from + size - 1);
+    if (envio) q = q.eq('envio', envio);
+    q = q.order('registrado_at', { ascending: true });
+    const { data, error } = await q;
+    if (error) throw new Error(error.message);
+    out = out.concat(data || []);
+    if (!data || data.length < size) break;
+    from += size;
+    if (from > 30000) break;
+  }
+  return out;
+}
+
+// Registrar los ítems de un envío (no pisa lo ya escaneado)
+app.post('/api/despacho/full/registrar', async (req, res) => {
+  try {
+    const items = (req.body && req.body.items) || [];
+    if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'No hay ítems para registrar' });
+    const rows = items.filter(x => x && x.id && x.reference_id).map(x => ({
+      id: String(x.id),
+      envio: String(x.envio || String(x.reference_id).split('/')[0]),
+      reference_id: String(x.reference_id),
+      tipo: x.tipo || null,
+      etiqueta: x.etiqueta || String(x.reference_id).split('/')[1] || null
+    }));
+    if (!rows.length) return res.status(400).json({ error: 'Ítems inválidos' });
+    // insert ignorando los que ya existen → preserva escaneado_at
+    const { error } = await supabase.from('dep_full_items').upsert(rows, { onConflict: 'id', ignoreDuplicates: true });
+    if (error) throw new Error(error.message);
+    const envio = rows[0].envio;
+    const all = await fetchAllFull(envio);
+    console.log(`[FULL][REGISTRAR] envío=${envio} ítems=${rows.length} total=${all.length}`);
+    res.json({ ok: true, envio, total: all.length,
+      escaneados: all.filter(x => x.escaneado_at).length,
+      bultos: all.filter(x => x.tipo === 'box').length,
+      pallets: all.filter(x => x.tipo === 'ppi').length });
+  } catch (e) { console.error('[FULL][REGISTRAR]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Lista de envíos Full cargados con su progreso
+app.get('/api/despacho/full/envios', async (_req, res) => {
+  try {
+    const all = await fetchAllFull(null);
+    const m = new Map();
+    for (const x of all) {
+      let e = m.get(x.envio);
+      if (!e) { e = { envio: x.envio, total: 0, escaneados: 0, bultos: 0, pallets: 0, ultimo: x.registrado_at }; m.set(x.envio, e); }
+      e.total++;
+      if (x.escaneado_at) e.escaneados++;
+      if (x.tipo === 'box') e.bultos++; else if (x.tipo === 'ppi') e.pallets++;
+      if ((x.registrado_at || '') > (e.ultimo || '')) e.ultimo = x.registrado_at;
+    }
+    const envios = [...m.values()].map(e => ({ ...e, faltan: e.total - e.escaneados, completo: e.escaneados >= e.total }))
+      .sort((a, b) => String(b.ultimo || '').localeCompare(String(a.ultimo || '')));
+    res.json({ envios });
+  } catch (e) { console.error('[FULL][ENVIOS]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Estado detallado de un envío (lista de ítems para tildar)
+app.get('/api/despacho/full/estado', async (req, res) => {
+  try {
+    const envio = (req.query.envio || '').trim();
+    if (!envio) return res.status(400).json({ error: 'Falta el envío' });
+    const items = (await fetchAllFull(envio)).map(x => ({
+      id: x.id, etiqueta: x.etiqueta, tipo: x.tipo, reference_id: x.reference_id,
+      escaneado: !!x.escaneado_at, escaneado_at: x.escaneado_at
+    }));
+    items.sort((a, b) => {
+      if (a.tipo !== b.tipo) return a.tipo === 'ppi' ? -1 : 1; // pallets primero
+      const na = parseInt(String(a.etiqueta).replace(/\D/g, '')) || 0;
+      const nb = parseInt(String(b.etiqueta).replace(/\D/g, '')) || 0;
+      return na - nb;
+    });
+    const total = items.length, escaneados = items.filter(x => x.escaneado).length;
+    res.json({ envio, total, escaneados, faltan: total - escaneados,
+      bultos: items.filter(x => x.tipo === 'box').length,
+      pallets: items.filter(x => x.tipo === 'ppi').length, items });
+  } catch (e) { console.error('[FULL][ESTADO]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Escanear un bulto/pallet → lo marca como verificado
+app.post('/api/despacho/full/escanear', async (req, res) => {
+  try {
+    const codigo = ((req.body && req.body.codigo) || '').trim();
+    const envioCtx = ((req.body && req.body.envio) || '').trim() || null;
+    if (!codigo) return res.status(400).json({ error: 'Falta el código' });
+    const id = parseFullId(codigo);
+    if (!id) return res.status(400).json({ error: 'No pude leer el código' });
+    const { data, error } = await supabase.from('dep_full_items').select('*').eq('id', id).limit(1);
+    if (error) throw new Error(error.message);
+    const it = data && data[0];
+    if (!it) return res.json({ resultado: 'no_pertenece', id, mensaje: 'Este código no es de ningún envío Full cargado' });
+    if (envioCtx && String(it.envio) !== String(envioCtx))
+      return res.json({ resultado: 'otro_envio', id, envio_real: it.envio, etiqueta: it.etiqueta, tipo: it.tipo,
+        mensaje: `Este ítem es del envío ${it.envio}, no del ${envioCtx}` });
+    if (it.escaneado_at)
+      return res.json({ resultado: 'duplicada', id, etiqueta: it.etiqueta, tipo: it.tipo, escaneado_at: it.escaneado_at,
+        mensaje: 'Ya estaba escaneado' });
+    const { error: e2 } = await supabase.from('dep_full_items')
+      .update({ escaneado_at: new Date().toISOString(), usuario: (req.authUser && req.authUser.email) || null })
+      .eq('id', id);
+    if (e2) throw new Error(e2.message);
+    const items = await fetchAllFull(it.envio);
+    const total = items.length;
+    const escaneados = items.filter(x => x.escaneado_at || x.id === id).length;
+    return res.json({ resultado: 'ok', id, etiqueta: it.etiqueta, tipo: it.tipo, envio: it.envio,
+      total, escaneados, faltan: total - escaneados });
+  } catch (e) { console.error('[FULL][ESCANEAR]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Desmarcar (si me equivoqué al escanear)
+app.post('/api/despacho/full/desmarcar', async (req, res) => {
+  try {
+    const id = parseFullId((req.body && (req.body.codigo || req.body.id)) || '');
+    if (!id) return res.status(400).json({ error: 'Falta el id' });
+    const { error } = await supabase.from('dep_full_items').update({ escaneado_at: null }).eq('id', id);
+    if (error) throw new Error(error.message);
+    res.json({ ok: true, id });
+  } catch (e) { console.error('[FULL][DESMARCAR]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Borrar un envío completo (limpieza)
+app.post('/api/despacho/full/borrar', async (req, res) => {
+  try {
+    const envio = ((req.body && req.body.envio) || '').trim();
+    if (!envio) return res.status(400).json({ error: 'Falta el envío' });
+    const { error } = await supabase.from('dep_full_items').delete().eq('envio', envio);
+    if (error) throw new Error(error.message);
+    res.json({ ok: true, envio });
+  } catch (e) { console.error('[FULL][BORRAR]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.40-colecta-full' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

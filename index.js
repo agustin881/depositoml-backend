@@ -2241,7 +2241,7 @@ app.get('/api/despacho/despachados', async (_req, res) => {
 app.get('/api/despacho/camiones', async (_req, res) => {
   try {
     const { data, error } = await supabase.from('dep_camiones')
-      .select('id,patente,descripcion,activo').eq('activo', true)
+      .select('id,patente,descripcion,tipo,observaciones,telefono,activo').eq('activo', true)
       .order('patente', { ascending: true });
     if (error) throw new Error(error.message);
     res.json({ camiones: data || [] });
@@ -2250,16 +2250,20 @@ app.get('/api/despacho/camiones', async (_req, res) => {
 
 app.post('/api/despacho/camiones', async (req, res) => {
   try {
-    const patente = ((req.body && req.body.patente) || '').trim().toUpperCase();
-    const descripcion = ((req.body && req.body.descripcion) || '').trim();
+    const b = req.body || {};
+    const patente = (b.patente || '').trim().toUpperCase();
+    const descripcion = (b.descripcion || '').trim();
+    const tipo = (b.tipo || '').trim();
+    const observaciones = (b.observaciones || '').trim();
+    const telefono = (b.telefono || '').trim();
     if (!patente) return res.status(400).json({ error: 'Falta la patente' });
     // ¿ya existe esa patente activa? la reusamos
     const { data: ex } = await supabase.from('dep_camiones')
-      .select('id,patente,descripcion,activo').eq('patente', patente).eq('activo', true).limit(1);
+      .select('id,patente,descripcion,tipo,observaciones,telefono,activo').eq('patente', patente).eq('activo', true).limit(1);
     if (ex && ex[0]) return res.json({ camion: ex[0], existia: true });
     const { data, error } = await supabase.from('dep_camiones')
-      .insert({ patente, descripcion, activo: true })
-      .select('id,patente,descripcion,activo').limit(1);
+      .insert({ patente, descripcion, tipo, observaciones, telefono, activo: true })
+      .select('id,patente,descripcion,tipo,observaciones,telefono,activo').limit(1);
     if (error) throw new Error(error.message);
     res.json({ camion: (data && data[0]) || null });
   } catch (e) { console.error('[CAMIONES]', e.message); res.status(500).json({ error: e.message }); }
@@ -2268,14 +2272,18 @@ app.post('/api/despacho/camiones', async (req, res) => {
 // Editar un camión (patente / chofer-descripción)
 app.post('/api/despacho/camiones/editar', async (req, res) => {
   try {
-    const id = (req.body && req.body.id) || null;
-    const patente = ((req.body && req.body.patente) || '').trim().toUpperCase();
-    const descripcion = ((req.body && req.body.descripcion) || '').trim();
+    const b = req.body || {};
+    const id = b.id || null;
+    const patente = (b.patente || '').trim().toUpperCase();
+    const descripcion = (b.descripcion || '').trim();
+    const tipo = (b.tipo || '').trim();
+    const observaciones = (b.observaciones || '').trim();
+    const telefono = (b.telefono || '').trim();
     if (!id) return res.status(400).json({ error: 'Falta el id' });
     if (!patente) return res.status(400).json({ error: 'Falta la patente' });
     const { data, error } = await supabase.from('dep_camiones')
-      .update({ patente, descripcion }).eq('id', id)
-      .select('id,patente,descripcion,activo').limit(1);
+      .update({ patente, descripcion, tipo, observaciones, telefono }).eq('id', id)
+      .select('id,patente,descripcion,tipo,observaciones,telefono,activo').limit(1);
     if (error) throw new Error(error.message);
     res.json({ camion: (data && data[0]) || null });
   } catch (e) { console.error('[CAMIONES-EDIT]', e.message); res.status(500).json({ error: e.message }); }
@@ -2881,7 +2889,7 @@ app.post('/api/despacho/full/borrar', async (req, res) => {
   } catch (e) { console.error('[FULL][BORRAR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.40-colecta-full' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.41-camiones-campos' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

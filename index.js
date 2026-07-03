@@ -498,25 +498,36 @@ async function armarPdf(shipments, token) {
   const motivos = []; // por qué rechazó ML cada etiqueta (para informar al frontend)
 
   // Procesa un envío individual: página 0 = etiqueta, resto = detalle
+  // Con reintentos: si ML limita la velocidad (429) o falla (5xx), espera y reintenta.
   async function pedirUno(s) {
-    try {
-      const r = await fetch(
-        `https://api.mercadolibre.com/shipment_labels?shipment_ids=${s.shipment_id}&response_type=pdf`,
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      if (!r.ok) {
+    for (let intento = 1; intento <= 3; intento++) {
+      try {
+        const r = await fetch(
+          `https://api.mercadolibre.com/shipment_labels?shipment_ids=${s.shipment_id}&response_type=pdf`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (r.ok) return await r.buffer();
+        if ((r.status === 429 || r.status >= 500) && intento < 3) {
+          await sleep(intento * 2000); // 2s, luego 4s
+          continue;
+        }
         let detalleML = '';
         try { const j = await r.json(); detalleML = j.message || j.error || ''; } catch (e) {}
         console.error(`[ETIQUETA] ship=${s.shipment_id} HTTP ${r.status} ${detalleML}`);
         motivos.push({ ship: s.shipment_id, status: r.status, detalle: detalleML });
         return null;
+      } catch (e) {
+        if (intento < 3) { await sleep(intento * 2000); continue; }
+        console.error(`[ETIQUETA] ship=${s.shipment_id}: ${e.message}`);
+        motivos.push({ ship: s.shipment_id, status: 0, detalle: e.message });
+        return null;
       }
-      return await r.buffer();
-    } catch (e) { console.error(`[ETIQUETA] ship=${s.shipment_id}: ${e.message}`); motivos.push({ ship: s.shipment_id, status: 0, detalle: e.message }); return null; }
+    }
+    return null;
   }
 
   async function unirIndividual(chunk) {
-    const buffers = await poolMap(chunk, 5, pedirUno);
+    const buffers = await poolMap(chunk, 2, pedirUno); // de a 2 para no saturar a ML
     for (let i = 0; i < buffers.length; i++) {
       const buf = buffers[i];
       if (!buf || buf.__error) { fallidas++; continue; }
@@ -586,7 +597,7 @@ async function armarPdf(shipments, token) {
       }
     }
     if (!unido) await unirIndividual(lote);
-    await sleep(200);
+    await sleep(1500); // pausa real entre lotes de 50 para respetar el límite de ML
   }
 
   // Combinar: primero todas las etiquetas (orden SKU), después los detalles
@@ -654,12 +665,28 @@ async function registrarImpresion(impresos, tipo) {
   if (error) console.error('[REGISTRO] error guardando impresión:', error.message);
 }
 
-function pdfResponse(res, bytes, ok, fallidas, nombre) {
+function pdfResponse(res, bytes, ok, fallidas, nombre, motivo) {
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `attachment; filename="${nombre}"`);
   res.setHeader('X-Etiquetas-Unidas', String(ok));
   res.setHeader('X-Etiquetas-Fallidas', String(fallidas));
+  if (motivo) res.setHeader('X-Etiquetas-Motivo', encodeURIComponent(String(motivo).slice(0, 300)));
   res.send(Buffer.from(bytes));
+}
+
+// Resume los motivos de rechazo para un fallo PARCIAL (algunas sí, otras no)
+function resumirMotivos(motivos) {
+  if (!motivos || !motivos.length) return '';
+  const cuenta = {};
+  for (const m of motivos) cuenta[m.status] = (cuenta[m.status] || 0) + 1;
+  const [status] = Object.entries(cuenta).sort((a, b) => b[1] - a[1])[0]; // el status más repetido
+  const st = Number(status);
+  const det = (motivos.find(m => m.status === st && m.detalle) || {}).detalle || '';
+  if (st === 429) return 'ML limitó la velocidad (429): esperá 1 minuto y reimprimí las que faltaron desde "Impresas hoy"';
+  if (st === 401 || st === 403) return `autorización (HTTP ${st}): el token de ML necesita reconexión`;
+  if (st === 400 || st === 404) return `HTTP ${st}${det ? ' ' + det : ''}: envíos aún no listos para imprimir o con estado cambiado`;
+  if (st === 0) return `error de red${det ? ': ' + det : ''}`;
+  return `HTTP ${st}${det ? ': ' + det : ''}`;
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1204,7 +1231,7 @@ app.get('/api/despacho/etiquetas', async (req, res) => {
     if (!impresos.length) return res.status(404).json({ error: explicarFalloEtiquetas(motivos) });
     await registrarImpresion(impresos, tipo);
     console.log(`[ETIQUETAS] tipo=${tipo} unidas=${impresos.length} fallidas=${fallidas}`);
-    pdfResponse(res, bytes, impresos.length, fallidas, `etiquetas_${tipo}_${fechaHoyART()}.pdf`);
+    pdfResponse(res, bytes, impresos.length, fallidas, `etiquetas_${tipo}_${fechaHoyART()}.pdf`, fallidas ? resumirMotivos(motivos) : null);
   } catch (e) { console.error('[ETIQUETAS]', e.message); res.status(500).json({ error: e.message }); }
 });
 
@@ -1239,7 +1266,7 @@ app.get('/api/despacho/etiquetas-seleccion', async (req, res) => {
     for (const [tipo, arr] of Object.entries(porTipo)) await registrarImpresion(arr, tipo);
 
     console.log(`[ETIQUETAS-SEL] pedidas=${lista.length} unidas=${impresos.length} fallidas=${fallidas}`);
-    pdfResponse(res, bytes, impresos.length, fallidas, `etiquetas_seleccion_${fechaHoyART()}.pdf`);
+    pdfResponse(res, bytes, impresos.length, fallidas, `etiquetas_seleccion_${fechaHoyART()}.pdf`, fallidas ? resumirMotivos(motivos) : null);
   } catch (e) { console.error('[ETIQUETAS-SEL]', e.message); res.status(500).json({ error: e.message }); }
 });
 
@@ -1293,10 +1320,11 @@ app.get('/api/despacho/reimprimir', async (req, res) => {
     if (!lista.length) return res.status(404).json({ error: 'No hay nada para reimprimir' });
     lista.sort((a, b) => (a.sku || 'zzz').localeCompare(b.sku || 'zzz', 'es', { numeric: true }));
     const token = await getValidToken(ML_USER_ID);
-    const { bytes, impresos, fallidas } = await armarPdf(lista, token);
+    const { bytes, impresos, fallidas, motivos } = await armarPdf(lista, token);
+    if (!impresos.length) return res.status(404).json({ error: explicarFalloEtiquetas(motivos) });
     console.log(`[REIMPRIMIR] pedidas=${lista.length} unidas=${impresos.length} fallidas=${fallidas}`);
     const nombre = ventaParam ? `reimpresion_venta_${ventaParam}.pdf` : `reimpresion_${fechaHoyART()}.pdf`;
-    pdfResponse(res, bytes, impresos.length, fallidas, nombre);
+    pdfResponse(res, bytes, impresos.length, fallidas, nombre, fallidas ? resumirMotivos(motivos) : null);
   } catch (e) { console.error('[REIMPRIMIR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
@@ -2911,7 +2939,7 @@ app.post('/api/despacho/full/borrar', async (req, res) => {
   } catch (e) { console.error('[FULL][BORRAR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.42-error-etiquetas-claro' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.43-etiquetas-robustas' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

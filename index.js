@@ -495,6 +495,7 @@ async function armarPdf(shipments, token) {
   const etiquetas = await PDFDocument.create();
   const detalles  = await PDFDocument.create();
   const impresos = []; let fallidas = 0;
+  const motivos = []; // por qué rechazó ML cada etiqueta (para informar al frontend)
 
   // Procesa un envío individual: página 0 = etiqueta, resto = detalle
   async function pedirUno(s) {
@@ -503,9 +504,15 @@ async function armarPdf(shipments, token) {
         `https://api.mercadolibre.com/shipment_labels?shipment_ids=${s.shipment_id}&response_type=pdf`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
-      if (!r.ok) { console.error(`[ETIQUETA] ship=${s.shipment_id} HTTP ${r.status}`); return null; }
+      if (!r.ok) {
+        let detalleML = '';
+        try { const j = await r.json(); detalleML = j.message || j.error || ''; } catch (e) {}
+        console.error(`[ETIQUETA] ship=${s.shipment_id} HTTP ${r.status} ${detalleML}`);
+        motivos.push({ ship: s.shipment_id, status: r.status, detalle: detalleML });
+        return null;
+      }
       return await r.buffer();
-    } catch (e) { console.error(`[ETIQUETA] ship=${s.shipment_id}: ${e.message}`); return null; }
+    } catch (e) { console.error(`[ETIQUETA] ship=${s.shipment_id}: ${e.message}`); motivos.push({ ship: s.shipment_id, status: 0, detalle: e.message }); return null; }
   }
 
   async function unirIndividual(chunk) {
@@ -590,7 +597,21 @@ async function armarPdf(shipments, token) {
   detPages.forEach(p => merged.addPage(p));
 
   const bytes = await merged.save();
-  return { bytes, impresos, fallidas };
+  return { bytes, impresos, fallidas, motivos };
+}
+
+// Arma un mensaje entendible cuando ML rechazó TODAS las etiquetas
+function explicarFalloEtiquetas(motivos) {
+  if (!motivos || !motivos.length) return 'No se pudo generar ninguna etiqueta';
+  const m = motivos[0];
+  const cuantas = motivos.length;
+  if (m.status === 401 || m.status === 403)
+    return `ML rechazó las ${cuantas} etiqueta(s) por autorización (HTTP ${m.status}). El token de ML está vencido: reconectá Mercado Libre y volvé a intentar.`;
+  if (m.status === 400 || m.status === 404)
+    return `ML rechazó las ${cuantas} etiqueta(s) (HTTP ${m.status}${m.detalle ? ': ' + m.detalle : ''}). Suele pasar cuando el envío todavía no está listo para imprimir (ej. es de mañana) o ya cambió de estado.`;
+  if (m.status === 0)
+    return `No pude conectar con ML para generar las etiquetas (${m.detalle || 'error de red'}). Reintentá en un rato.`;
+  return `ML rechazó las ${cuantas} etiqueta(s) (HTTP ${m.status}${m.detalle ? ': ' + m.detalle : ''}).`;
 }
 
 // ── Helper: número de venta (o Pack ID) → datos del envío ─────────
@@ -1179,7 +1200,8 @@ app.get('/api/despacho/etiquetas', async (req, res) => {
     const tipo = (req.query.tipo || '').toLowerCase();
     const { listos, token } = await obtenerEnvios(tipo);
     if (!listos.length) return res.status(404).json({ error: 'No hay envíos listos para imprimir en esta tanda' });
-    const { bytes, impresos, fallidas } = await armarPdf(listos, token);
+    const { bytes, impresos, fallidas, motivos } = await armarPdf(listos, token);
+    if (!impresos.length) return res.status(404).json({ error: explicarFalloEtiquetas(motivos) });
     await registrarImpresion(impresos, tipo);
     console.log(`[ETIQUETAS] tipo=${tipo} unidas=${impresos.length} fallidas=${fallidas}`);
     pdfResponse(res, bytes, impresos.length, fallidas, `etiquetas_${tipo}_${fechaHoyART()}.pdf`);
@@ -1208,8 +1230,8 @@ app.get('/api/despacho/etiquetas-seleccion', async (req, res) => {
 
     const token = await getValidToken(ML_USER_ID);
     if (!token) throw new Error('No hay token de ML disponible');
-    const { bytes, impresos, fallidas } = await armarPdf(lista, token);
-    if (!impresos.length) return res.status(404).json({ error: 'No se pudo generar ninguna etiqueta' });
+    const { bytes, impresos, fallidas, motivos } = await armarPdf(lista, token);
+    if (!impresos.length) return res.status(404).json({ error: explicarFalloEtiquetas(motivos) });
 
     // Registrar impresión agrupando por tanda
     const porTipo = {};
@@ -2889,7 +2911,7 @@ app.post('/api/despacho/full/borrar', async (req, res) => {
   } catch (e) { console.error('[FULL][BORRAR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.41-camiones-campos' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.42-error-etiquetas-claro' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

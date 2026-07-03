@@ -306,6 +306,15 @@ async function obtenerShipmentsDetallados(token, onLote) {
     !DEPOSITO_FILTRO ? true
       : (!s.dep_dir ? true : normalizar(s.dep_dir).includes(DEPOSITO_FILTRO) || s.dep_id === DEPOSITO_FILTRO);
 
+  // Estadísticas por depósito de origen (para verificar qué entra y qué queda afuera)
+  const statsDep = new Map();
+  const anotarDep = (s, incluido) => {
+    const k = s.dep_dir || '(sin dirección informada por ML)';
+    let e = statsDep.get(k);
+    if (!e) { e = { deposito: k, incluidos: 0, excluidos: 0 }; statsDep.set(k, e); }
+    if (incluido) e.incluidos++; else e.excluidos++;
+  };
+
   // Procesar en bloques: traer detalle (12 en paralelo) y, si hay callback,
   // guardar ese bloque ya filtrado antes de seguir (carga incremental/robusta).
   const BLOQUE = 120;
@@ -314,7 +323,7 @@ async function obtenerShipmentsDetallados(token, onLote) {
   for (let i = 0; i < shipments.length; i += BLOQUE) {
     const bloque = shipments.slice(i, i + BLOQUE);
     const detallados = await poolMap(bloque, 12, traerDetalle);
-    const delDeposito = detallados.filter(s => { const ok = pasaFiltro(s); if (!ok) afuera++; return ok; });
+    const delDeposito = detallados.filter(s => { const ok = pasaFiltro(s); anotarDep(s, ok); if (!ok) afuera++; return ok; });
     if (onLote && delDeposito.length) { try { await onLote(delDeposito); } catch (e) { console.error('[ENVIOS] onLote', e.message); } }
     for (const s of delDeposito) todos.push(s);
     procesados += bloque.length;
@@ -322,8 +331,12 @@ async function obtenerShipmentsDetallados(token, onLote) {
     await sleep(120);
   }
   if (afuera) console.log(`[ENVIOS] ${afuera} envío(s) de otro depósito quedaron afuera`);
+  _depositosStats = { filtro: DEPOSITO_FILTRO || '(desactivado: entra todo)', depositos: [...statsDep.values()].sort((a,b)=>b.incluidos-a.incluidos || b.excluidos-a.excluidos), actualizado: new Date().toISOString() };
   return todos;
 }
+
+// Última foto de depósitos vista al recorrer los envíos de ML
+let _depositosStats = null;
 
 // ── Foto local: mapear un envío a la fila de dep_envios ───────────
 const tipoDeLogistic = lt =>
@@ -504,7 +517,7 @@ async function armarPdf(shipments, token) {
       try {
         const r = await fetch(
           `https://api.mercadolibre.com/shipment_labels?shipment_ids=${s.shipment_id}&response_type=pdf`,
-          { headers: { Authorization: `Bearer ${token}` } }
+          { headers: { Authorization: `Bearer ${token}`, Connection: 'close', 'Accept-Encoding': 'identity' }, compress: false }
         );
         if (r.ok) return await r.buffer();
         if ((r.status === 429 || r.status >= 500) && intento < 3) {
@@ -563,7 +576,7 @@ async function armarPdf(shipments, token) {
       const ids = lote.map(s => s.shipment_id).join(',');
       const r = await fetch(
         `https://api.mercadolibre.com/shipment_labels?shipment_ids=${ids}&response_type=pdf`,
-        { headers: { Authorization: `Bearer ${token}` } }
+        { headers: { Authorization: `Bearer ${token}`, Connection: 'close', 'Accept-Encoding': 'identity' }, compress: false }
       );
       if (r.ok) buf = await r.buffer();
       else console.error(`[ETIQUETAS] lote de ${lote.length} HTTP ${r.status} → reintento de a uno`);
@@ -1206,6 +1219,17 @@ app.post('/api/despacho/separar-lote', async (req, res) => {
 });
 
 // ── Endpoints: impresión ──────────────────────────────────────────
+// ── Depósitos de origen: qué está entrando y qué queda afuera ─────
+app.get('/api/despacho/depositos', async (_req, res) => {
+  try {
+    if (!_depositosStats) {
+      const token = await getValidToken(ML_USER_ID);
+      if (token) await obtenerDetalladosConCache(token); // fuerza una pasada si nunca corrió
+    }
+    res.json(_depositosStats || { filtro: DEPOSITO_FILTRO || '(desactivado: entra todo)', depositos: [], actualizado: null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/despacho/pendientes', async (req, res) => {
   try {
     const tipo = (req.query.tipo || '').toLowerCase();
@@ -2806,7 +2830,7 @@ async function fetchAllFull(envio) {
   let out = [], from = 0; const size = 1000;
   for (;;) {
     let q = supabase.from('dep_full_items')
-      .select('id,envio,reference_id,tipo,etiqueta,escaneado_at,registrado_at')
+      .select('id,envio,reference_id,tipo,etiqueta,escaneado_at,registrado_at,destino,deposito')
       .range(from, from + size - 1);
     if (envio) q = q.eq('envio', envio);
     q = q.order('registrado_at', { ascending: true });
@@ -2830,11 +2854,14 @@ app.post('/api/despacho/full/registrar', async (req, res) => {
       envio: String(x.envio || String(x.reference_id).split('/')[0]),
       reference_id: String(x.reference_id),
       tipo: x.tipo || null,
-      etiqueta: x.etiqueta || String(x.reference_id).split('/')[1] || null
+      etiqueta: x.etiqueta || String(x.reference_id).split('/')[1] || null,
+      destino: x.destino || null,
+      deposito: x.deposito || null
     }));
     if (!rows.length) return res.status(400).json({ error: 'Ítems inválidos' });
-    // insert ignorando los que ya existen → preserva escaneado_at
-    const { error } = await supabase.from('dep_full_items').upsert(rows, { onConflict: 'id', ignoreDuplicates: true });
+    // upsert con merge: si ya existe actualiza estos campos (sirve para completar
+    // destino/depósito re-subiendo el archivo) SIN tocar escaneado_at
+    const { error } = await supabase.from('dep_full_items').upsert(rows, { onConflict: 'id' });
     if (error) throw new Error(error.message);
     const envio = rows[0].envio;
     const all = await fetchAllFull(envio);
@@ -2853,13 +2880,19 @@ app.get('/api/despacho/full/envios', async (_req, res) => {
     const m = new Map();
     for (const x of all) {
       let e = m.get(x.envio);
-      if (!e) { e = { envio: x.envio, total: 0, escaneados: 0, bultos: 0, pallets: 0, ultimo: x.registrado_at }; m.set(x.envio, e); }
+      if (!e) { e = { envio: x.envio, total: 0, escaneados: 0, bultos: 0, pallets: 0, ultimo: x.registrado_at, _dest: new Set(), _dep: new Set() }; m.set(x.envio, e); }
       e.total++;
       if (x.escaneado_at) e.escaneados++;
       if (x.tipo === 'box') e.bultos++; else if (x.tipo === 'ppi') e.pallets++;
+      if (x.destino) e._dest.add(x.destino);
+      if (x.deposito) e._dep.add(x.deposito);
       if ((x.registrado_at || '') > (e.ultimo || '')) e.ultimo = x.registrado_at;
     }
-    const envios = [...m.values()].map(e => ({ ...e, faltan: e.total - e.escaneados, completo: e.escaneados >= e.total }))
+    const envios = [...m.values()].map(e => ({
+      envio: e.envio, total: e.total, escaneados: e.escaneados, bultos: e.bultos, pallets: e.pallets,
+      ultimo: e.ultimo, destino: [...e._dest].join('/') || null, deposito: [...e._dep].join('/') || null,
+      faltan: e.total - e.escaneados, completo: e.escaneados >= e.total
+    }))
       .sort((a, b) => String(b.ultimo || '').localeCompare(String(a.ultimo || '')));
     res.json({ envios });
   } catch (e) { console.error('[FULL][ENVIOS]', e.message); res.status(500).json({ error: e.message }); }
@@ -2881,7 +2914,10 @@ app.get('/api/despacho/full/estado', async (req, res) => {
       return na - nb;
     });
     const total = items.length, escaneados = items.filter(x => x.escaneado).length;
-    res.json({ envio, total, escaneados, faltan: total - escaneados,
+    const crudos = await fetchAllFull(envio);
+    const destino = [...new Set(crudos.map(x => x.destino).filter(Boolean))].join('/') || null;
+    const deposito = [...new Set(crudos.map(x => x.deposito).filter(Boolean))].join('/') || null;
+    res.json({ envio, total, escaneados, faltan: total - escaneados, destino, deposito,
       bultos: items.filter(x => x.tipo === 'box').length,
       pallets: items.filter(x => x.tipo === 'ppi').length, items });
   } catch (e) { console.error('[FULL][ESTADO]', e.message); res.status(500).json({ error: e.message }); }
@@ -2939,7 +2975,7 @@ app.post('/api/despacho/full/borrar', async (req, res) => {
   } catch (e) { console.error('[FULL][BORRAR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.43-etiquetas-robustas' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.46-info-depositos' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

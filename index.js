@@ -323,11 +323,15 @@ async function obtenerShipmentsDetallados(token, onLote) {
   for (let i = 0; i < shipments.length; i += BLOQUE) {
     const bloque = shipments.slice(i, i + BLOQUE);
     const detallados = await poolMap(bloque, 12, traerDetalle);
-    const delDeposito = detallados.filter(s => { const ok = pasaFiltro(s); anotarDep(s, ok); if (!ok) afuera++; return ok; });
+    // Marcamos cuáles son de nuestro depósito; guardamos TODOS en memoria
+    // (para poder consultar otros depósitos) pero la foto local (onLote)
+    // sigue recibiendo SOLO los nuestros, igual que siempre.
+    const conMarca = detallados.map(s => { s.es_nuestro = pasaFiltro(s); anotarDep(s, s.es_nuestro); if (!s.es_nuestro) afuera++; return s; });
+    const delDeposito = conMarca.filter(s => s.es_nuestro);
     if (onLote && delDeposito.length) { try { await onLote(delDeposito); } catch (e) { console.error('[ENVIOS] onLote', e.message); } }
-    for (const s of delDeposito) todos.push(s);
+    for (const s of conMarca) todos.push(s);
     procesados += bloque.length;
-    console.log(`[ENVIOS] progreso ${procesados}/${shipments.length} (acumulado nuestro: ${todos.length})`);
+    console.log(`[ENVIOS] progreso ${procesados}/${shipments.length} (nuestro: ${todos.filter(x=>x.es_nuestro).length} · otros: ${afuera})`);
     await sleep(120);
   }
   if (afuera) console.log(`[ENVIOS] ${afuera} envío(s) de otro depósito quedaron afuera`);
@@ -465,14 +469,19 @@ setInterval(async () => {
 }, 60 * 1000);
 
 // ── Envíos de una tanda (flex/colecta), ordenados por SKU ─────────
-async function obtenerEnvios(tipo) {
+async function obtenerEnvios(tipo, deposito) {
   const logisticBuscado = LOGISTIC[tipo];
   if (!logisticBuscado) throw new Error('Tipo inválido (usá flex o colecta)');
   const token = await getValidToken(ML_USER_ID);
   if (!token) throw new Error('No hay token de ML disponible en ml_tokens');
 
   const detallados = await obtenerDetalladosConCache(token);
-  const deLaTanda = detallados.filter(s => s.logistic === logisticBuscado);
+  const depBuscado = deposito ? normalizar(String(deposito)) : null;
+  const deLaTanda = detallados
+    .filter(s => s.logistic === logisticBuscado)
+    .filter(s => depBuscado
+      ? normalizar(s.dep_dir || '') === depBuscado          // depósito puntual pedido
+      : s.es_nuestro !== false);                            // por defecto: solo el nuestro
 
   // Criterio (copiando a ML): "listo para imprimir" = substatus
   // ready_to_print (o ready_to_ship sin substatus). Los "programados"
@@ -1233,9 +1242,10 @@ app.get('/api/despacho/depositos', async (_req, res) => {
 app.get('/api/despacho/pendientes', async (req, res) => {
   try {
     const tipo = (req.query.tipo || '').toLowerCase();
-    const { listos, programados, no_listos } = await obtenerEnvios(tipo);
+    const deposito = (req.query.deposito || '').trim() || null;
+    const { listos, programados, no_listos } = await obtenerEnvios(tipo, deposito);
     res.json({
-      tipo, cantidad: listos.length,
+      tipo, deposito, cantidad: listos.length,
       listos: listos.map(({ shipment_id, nro_venta, sku, titulo, unidades }) =>
         ({ shipment_id, nro_venta, sku, titulo, unidades })),
       programados: programados.map(({ shipment_id, nro_venta, sku, titulo, unidades, limite }) =>
@@ -1249,7 +1259,8 @@ app.get('/api/despacho/pendientes', async (req, res) => {
 app.get('/api/despacho/etiquetas', async (req, res) => {
   try {
     const tipo = (req.query.tipo || '').toLowerCase();
-    const { listos, token } = await obtenerEnvios(tipo);
+    const deposito = (req.query.deposito || '').trim() || null;
+    const { listos, token } = await obtenerEnvios(tipo, deposito);
     if (!listos.length) return res.status(404).json({ error: 'No hay envíos listos para imprimir en esta tanda' });
     const { bytes, impresos, fallidas, motivos } = await armarPdf(listos, token);
     if (!impresos.length) return res.status(404).json({ error: explicarFalloEtiquetas(motivos) });
@@ -2502,7 +2513,7 @@ app.get('/api/despacho/seguimiento', async (_req, res) => {
   try {
     const token = await getValidToken(ML_USER_ID);
     if (!token) throw new Error('No hay token de ML disponible');
-    const reales = await obtenerDetalladosConCache(token);
+    const reales = (await obtenerDetalladosConCache(token)).filter(s => s.es_nuestro !== false);
     const demo = await obtenerDemo();
     const detallados = [...reales, ...demo];
     const ids = detallados.map(s => s.shipment_id);
@@ -2975,7 +2986,7 @@ app.post('/api/despacho/full/borrar', async (req, res) => {
   } catch (e) { console.error('[FULL][BORRAR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.46-info-depositos' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.47-otros-depositos' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

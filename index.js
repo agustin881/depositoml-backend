@@ -29,6 +29,8 @@ const ML_CLIENT_ID     = process.env.ML_CLIENT_ID;
 const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET;
 const ML_USER_ID       = process.env.ML_USER_ID || '67619515';
 const DIAS_BUSQUEDA    = parseInt(process.env.DIAS_BUSQUEDA || '8', 10);
+const MAX_ORDENES      = parseInt(process.env.MAX_ORDENES || '6000', 10); // tope de ventas a recorrer (20k/mes ≈ 5.300 en 8 días)
+const CLAVE_DIAG       = (process.env.CLAVE_DIAG || '').trim(); // clave de los endpoints diag y oauth/login (SIN valor por defecto: configurala en Railway)
 
 const LOGISTIC = { flex: 'self_service', colecta: 'cross_docking' };
 
@@ -103,7 +105,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function requireAuth(req, res, next) {
   try {
     // Excepción temporal: diagnóstico accesible con clave en la URL (para debug)
-    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas' || req.path === '/diag-fechas' || req.path === '/diag-nodo' || req.path === '/diag-imprimir' || req.path === '/diag-camion' || req.path === '/diag-fechadesp' || req.path === '/diag-skus' || req.path === '/diag-cancel' || req.path === '/diag-colcancel' || req.path === '/diag-key') && (req.query.clave || '') === 'pontec2026') return next();
+    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas' || req.path === '/diag-fechas' || req.path === '/diag-nodo' || req.path === '/diag-imprimir' || req.path === '/diag-camion' || req.path === '/diag-fechadesp' || req.path === '/diag-skus' || req.path === '/diag-cancel' || req.path === '/diag-colcancel' || req.path === '/diag-key') && CLAVE_DIAG && (req.query.clave || '') === CLAVE_DIAG) return next();
     const h = req.headers.authorization || '';
     const token = h.startsWith('Bearer ') ? h.slice(7) : '';
     if (!token) return res.status(401).json({ error: 'No autorizado' });
@@ -127,23 +129,46 @@ function diaSemanaHoyART()  {
 }
 
 // ── Helper: token válido (mismo patrón que MargenML) ──────────────
+// Alerta visible cuando el refresh del token falla (se ve en GET / del backend)
+let _tokenAlerta = null;
+
 async function getValidToken(userId) {
   const { data: tokenRow } = await supabase
     .from('ml_tokens').select('*').eq('user_id', String(userId)).single();
   if (!tokenRow) return null;
   if (new Date(tokenRow.expires_at).getTime() - 60000 > Date.now()) return tokenRow.access_token;
 
-  const resp = await fetch('https://api.mercadolibre.com/oauth/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'refresh_token', client_id: ML_CLIENT_ID,
-      client_secret: ML_CLIENT_SECRET, refresh_token: tokenRow.refresh_token
-    })
-  });
-  const data = await resp.json();
-  if (data.error) { console.error('[TOKEN] refresh falló:', data); return tokenRow.access_token; }
+  // Token vencido → refresh con un reintento (los fallos transitorios son comunes)
+  let data = null;
+  for (let intento = 1; intento <= 2; intento++) {
+    try {
+      const resp = await fetch('https://api.mercadolibre.com/oauth/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'refresh_token', client_id: ML_CLIENT_ID,
+          client_secret: ML_CLIENT_SECRET, refresh_token: tokenRow.refresh_token
+        })
+      });
+      data = await resp.json();
+      if (!data.error) break;
+      console.error(`[TOKEN] ⚠️ refresh falló (intento ${intento}/2):`, JSON.stringify(data));
+      if (intento < 2) await sleep(2000);
+    } catch (e) {
+      console.error(`[TOKEN] ⚠️ refresh error de red (intento ${intento}/2):`, e.message);
+      data = { error: e.message };
+      if (intento < 2) await sleep(2000);
+    }
+  }
+  if (!data || data.error) {
+    _tokenAlerta = { desde: _tokenAlerta ? _tokenAlerta.desde : new Date().toISOString(),
+      ultimo_error: (data && (data.message || data.error)) || 'desconocido',
+      accion: 'El token de ML está vencido y el refresh falla. Reconectá ML: /api/oauth/login?clave=TU_CLAVE' };
+    console.error('[TOKEN] 🔴 usando token vencido como último recurso — RECONECTÁ MERCADO LIBRE');
+    return tokenRow.access_token; // último recurso: puede fallar con 401, pero los mensajes ahora lo explican
+  }
 
+  _tokenAlerta = null; // refresh OK → se levanta la alerta
   await supabase.from('ml_tokens').upsert({
     user_id: String(userId), access_token: data.access_token, refresh_token: data.refresh_token,
     expires_at: new Date(Date.now() + data.expires_in * 1000).toISOString(),
@@ -158,7 +183,7 @@ const OAUTH_REDIRECT = process.env.OAUTH_REDIRECT_URI ||
   'https://depositoml-backend-production.up.railway.app/api/oauth/callback';
 
 app.get('/api/oauth/login', (req, res) => {
-  if ((req.query.clave || '') !== 'pontec2026') return res.status(403).send('Falta la clave.');
+  if ((req.query.clave || '') !== CLAVE_DIAG || !CLAVE_DIAG) return res.status(403).send('Falta la clave.');
   const url = 'https://auth.mercadolibre.com.ar/authorization'
     + '?response_type=code'
     + '&client_id=' + encodeURIComponent(ML_CLIENT_ID)
@@ -241,7 +266,7 @@ async function obtenerShipmentsDetallados(token, onLote) {
 
   const ordenes = [];
   let offset = 0, total = 999;
-  while (offset < Math.min(total, 2000)) {
+  while (offset < Math.min(total, MAX_ORDENES)) {
     const url = `https://api.mercadolibre.com/orders/search?seller=${ML_USER_ID}`
       + `&order.status=paid`
       + `&order.date_created.from=${encodeURIComponent(desdeISO)}`
@@ -255,6 +280,7 @@ async function obtenerShipmentsDetallados(token, onLote) {
     offset += 50;
     await sleep(150);
   }
+  if (total > MAX_ORDENES) console.warn(`[ENVIOS] ⚠️ hay ${total} ventas en la ventana de ${DIAS_BUSQUEDA} días pero el tope MAX_ORDENES=${MAX_ORDENES} solo cubre las más nuevas. Subí MAX_ORDENES en Railway si necesitás ver más atrás.`);
 
   const porShipment = new Map();
   for (const o of ordenes) {
@@ -724,6 +750,14 @@ app.post('/api/despacho/webhook', async (req, res) => {
   res.sendStatus(200);
   try {
     const n = req.body || {};
+    // Seguridad: solo procesamos notificaciones de NUESTRA cuenta (y nuestra app, si está configurada).
+    // Cualquiera puede hacer POST a esta URL pública; lo ajeno se descarta sin guardar ni consultar a ML.
+    const deNuestraCuenta = String(n.user_id || '') === String(ML_USER_ID);
+    const deNuestraApp = !ML_CLIENT_ID || !n.application_id || String(n.application_id) === String(ML_CLIENT_ID);
+    if (!deNuestraCuenta || !deNuestraApp) {
+      console.warn(`[WEBHOOK] descartado (origen no reconocido): user=${n.user_id || '?'} app=${n.application_id || '?'}`);
+      return;
+    }
     console.log(`[WEBHOOK] topic=${n.topic || '?'} resource=${n.resource || '?'} user=${n.user_id || '?'}`);
     // Registro crudo (diagnóstico / auditoría)
     supabase.from('dep_webhooks').insert({
@@ -761,8 +795,8 @@ app.post('/api/despacho/webhook', async (req, res) => {
 
 // Inspección de los últimos webhooks recibidos (con clave, para el navegador)
 app.get('/api/despacho/webhook-diag', async (req, res) => {
-  if ((req.query.clave || '') !== 'pontec2026')
-    return res.status(401).json({ error: 'Agregá ?clave=pontec2026 al final de la URL' });
+  if ((req.query.clave || '') !== CLAVE_DIAG || !CLAVE_DIAG)
+    return res.status(401).json({ error: 'Falta la clave (configurá CLAVE_DIAG en Railway y usá ?clave=...)' });
   try {
     const { data, error } = await supabase.from('dep_webhooks')
       .select('topic,resource,ml_user_id,application_id,received_at')
@@ -986,7 +1020,7 @@ app.get('/api/despacho/panel', async (_req, res) => {
 });
 
 // ── DIAG: por qué el badge de Imprimir (Flex+Colecta) no coincide con el ──
-// total "para imprimir". Lista las que NO son Flex ni Colecta. ?clave=pontec2026
+// total "para imprimir". Lista las que NO son Flex ni Colecta. ?clave=TU_CLAVE
 app.get('/api/despacho/diag-imprimir', async (_req, res) => {
   try {
     const { data: imp } = await supabase.from('dep_impresiones').select('shipment_id');
@@ -1431,9 +1465,9 @@ async function colectasDelDia(token) {
 }
 
 // ── DIAGNÓSTICO: ¿la llave de servicio está bien? (no muestra la llave) ──
-// /api/despacho/diag-key?clave=pontec2026
+// /api/despacho/diag-key?clave=TU_CLAVE
 app.get('/api/despacho/diag-key', async (req, res) => {
-  if ((req.query.clave || '') !== 'pontec2026') return res.status(401).json({ error: 'Agregá ?clave=pontec2026' });
+  if ((req.query.clave || '') !== CLAVE_DIAG || !CLAVE_DIAG) return res.status(401).json({ error: 'Agregá ?clave=TU_CLAVE' });
   const k = process.env.SUPABASE_SERVICE_KEY || '';
   // Detectar rol de la llave (las keys de Supabase son JWT: header.payload.firma)
   let rol = 'desconocido';
@@ -1459,9 +1493,9 @@ app.get('/api/despacho/diag-key', async (req, res) => {
 });
 
 // ── DIAGNÓSTICO: encontrar las canceladas que se cuelan en "a despachar" ──
-// /api/despacho/diag-colcancel?clave=pontec2026   (revisa colecta del día y marca canceladas reales)
+// /api/despacho/diag-colcancel?clave=TU_CLAVE   (revisa colecta del día y marca canceladas reales)
 app.get('/api/despacho/diag-colcancel', async (req, res) => {
-  if ((req.query.clave || '') !== 'pontec2026') return res.status(401).json({ error: 'Agregá ?clave=pontec2026' });
+  if ((req.query.clave || '') !== CLAVE_DIAG || !CLAVE_DIAG) return res.status(401).json({ error: 'Agregá ?clave=TU_CLAVE' });
   try {
     const token = await getValidToken(ML_USER_ID);
     if (!token) throw new Error('No hay token');
@@ -1503,9 +1537,9 @@ app.get('/api/despacho/diag-colcancel', async (req, res) => {
 });
 
 // ── DIAGNÓSTICO: ¿cómo viene una venta cancelada? (orden vs envío) ──
-// /api/despacho/diag-cancel?clave=pontec2026&venta=NRO
+// /api/despacho/diag-cancel?clave=TU_CLAVE&venta=NRO
 app.get('/api/despacho/diag-cancel', async (req, res) => {
-  if ((req.query.clave || '') !== 'pontec2026') return res.status(401).json({ error: 'Agregá ?clave=pontec2026' });
+  if ((req.query.clave || '') !== CLAVE_DIAG || !CLAVE_DIAG) return res.status(401).json({ error: 'Agregá ?clave=TU_CLAVE' });
   try {
     const token = await getValidToken(ML_USER_ID);
     if (!token) throw new Error('No hay token de ML disponible');
@@ -1562,9 +1596,9 @@ setInterval(async () => {
 }, 5 * 60 * 1000);  // revisa cada 5 minutos si toca refrescar
 
 // ── DIAGNÓSTICO: ¿qué SKUs trae una venta/pack? ──
-// /api/despacho/diag-skus?clave=pontec2026&venta=NRO   (o &ship=ID)
+// /api/despacho/diag-skus?clave=TU_CLAVE&venta=NRO   (o &ship=ID)
 app.get('/api/despacho/diag-skus', async (req, res) => {
-  if ((req.query.clave || '') !== 'pontec2026') return res.status(401).json({ error: 'Agregá ?clave=pontec2026' });
+  if ((req.query.clave || '') !== CLAVE_DIAG || !CLAVE_DIAG) return res.status(401).json({ error: 'Agregá ?clave=TU_CLAVE' });
   try {
     const token = await getValidToken(ML_USER_ID);
     if (!token) throw new Error('No hay token de ML disponible');
@@ -1627,9 +1661,9 @@ app.get('/api/despacho/diag-skus', async (req, res) => {
 });
 
 // ── DIAGNÓSTICO: ¿qué campo trae la fecha de "Despachar: <día>"? ──
-// /api/despacho/diag-fechadesp?clave=pontec2026  (opcional &ship=ID)
+// /api/despacho/diag-fechadesp?clave=TU_CLAVE  (opcional &ship=ID)
 app.get('/api/despacho/diag-fechadesp', async (req, res) => {
-  if ((req.query.clave || '') !== 'pontec2026') return res.status(401).json({ error: 'Agregá ?clave=pontec2026' });
+  if ((req.query.clave || '') !== CLAVE_DIAG || !CLAVE_DIAG) return res.status(401).json({ error: 'Agregá ?clave=TU_CLAVE' });
   try {
     const token = await getValidToken(ML_USER_ID);
     if (!token) throw new Error('No hay token de ML disponible');
@@ -1668,10 +1702,10 @@ app.get('/api/despacho/diag-fechadesp', async (req, res) => {
   } catch (e) { console.error('[DIAG-FECHADESP]', e.message); res.status(500).json({ error: e.message }); }
 });
 
-// /api/despacho/diag-camion?clave=pontec2026  (opcional &ship=SHIPMENT_ID)
+// /api/despacho/diag-camion?clave=TU_CLAVE  (opcional &ship=SHIPMENT_ID)
 app.get('/api/despacho/diag-camion', async (req, res) => {
-  if ((req.query.clave || '') !== 'pontec2026')
-    return res.status(401).json({ error: 'Agregá ?clave=pontec2026' });
+  if ((req.query.clave || '') !== CLAVE_DIAG || !CLAVE_DIAG)
+    return res.status(401).json({ error: 'Agregá ?clave=TU_CLAVE' });
   try {
     const token = await getValidToken(ML_USER_ID);
     if (!token) throw new Error('No hay token de ML disponible');
@@ -1710,10 +1744,10 @@ app.get('/api/despacho/diag-camion', async (req, res) => {
 });
 
 // ── DIAGNÓSTICO de COLECTAS: prueba varias URLs de ML y muestra cuál responde ──
-// /api/despacho/diag-colectas?clave=pontec2026
+// /api/despacho/diag-colectas?clave=TU_CLAVE
 app.get('/api/despacho/diag-colectas', async (req, res) => {
-  if ((req.query.clave || '') !== 'pontec2026')
-    return res.status(401).json({ error: 'Agregá ?clave=pontec2026' });
+  if ((req.query.clave || '') !== CLAVE_DIAG || !CLAVE_DIAG)
+    return res.status(401).json({ error: 'Agregá ?clave=TU_CLAVE' });
   try {
     const token = await getValidToken(ML_USER_ID);
     if (!token) throw new Error('No hay token de ML disponible');
@@ -1754,7 +1788,7 @@ app.get('/api/despacho/colectas', async (_req, res) => {
 });
 
 // ── DIAGNÓSTICO: ¿multi-origen? ¿qué nodo trae el transportista/patente? ──
-// /api/despacho/diag-nodo  (app logueada)  ó  ?clave=pontec2026 (navegador)
+// /api/despacho/diag-nodo  (app logueada)  ó  ?clave=TU_CLAVE (navegador)
 app.get('/api/despacho/diag-nodo', async (_req, res) => {
   try {
     const token = await getValidToken(ML_USER_ID);
@@ -2634,10 +2668,10 @@ app.post('/api/despacho/demo/limpiar', async (_req, res) => {
 // ── DIAGNÓSTICO de FECHAS LÍMITE de despacho ──────────────────────
 // Toma envíos imprimibles y muestra todos los campos de fecha de ML,
 // para confirmar cuál es el "Despachar: X" real de la etiqueta.
-// /api/despacho/diag-fechas?clave=pontec2026
+// /api/despacho/diag-fechas?clave=TU_CLAVE
 app.get('/api/despacho/diag-fechas', async (req, res) => {
-  if ((req.query.clave || '') !== 'pontec2026')
-    return res.status(401).json({ error: 'Agregá ?clave=pontec2026' });
+  if ((req.query.clave || '') !== CLAVE_DIAG || !CLAVE_DIAG)
+    return res.status(401).json({ error: 'Agregá ?clave=TU_CLAVE' });
   try {
     const token = await getValidToken(ML_USER_ID);
     if (!token) throw new Error('No hay token de ML disponible');
@@ -2683,12 +2717,12 @@ app.get('/api/despacho/diag-fechas', async (req, res) => {
 // No filtra: cuenta envíos por estado, por logística y por depósito.
 // Sirve para entender por qué "no trae nada".
 // Abrir en el navegador con la clave (temporal, para debug):
-//   /api/despacho/diag?clave=pontec2026
+//   /api/despacho/diag?clave=TU_CLAVE
 // ── DIAGNÓSTICO de UN envío (para ubicar el número del QR de Colecta) ──
-// /api/despacho/diag-envio?clave=pontec2026&venta=2000015060172118
+// /api/despacho/diag-envio?clave=TU_CLAVE&venta=2000015060172118
 app.get('/api/despacho/diag-envio', async (req, res) => {
-  if ((req.query.clave || '') !== 'pontec2026')
-    return res.status(401).json({ error: 'Agregá ?clave=pontec2026' });
+  if ((req.query.clave || '') !== CLAVE_DIAG || !CLAVE_DIAG)
+    return res.status(401).json({ error: 'Agregá ?clave=TU_CLAVE' });
   try {
     const venta = (req.query.venta || '').trim();
     const buscar = (req.query.buscar || '').trim(); // número a ubicar (ej 46428401827)
@@ -2746,8 +2780,8 @@ app.get('/api/despacho/diag-envio', async (req, res) => {
 });
 
 app.get('/api/despacho/diag', async (req, res) => {
-  if ((req.query.clave || '') !== 'pontec2026')
-    return res.status(401).json({ error: 'Agregá ?clave=pontec2026 al final de la URL' });
+  if ((req.query.clave || '') !== CLAVE_DIAG || !CLAVE_DIAG)
+    return res.status(401).json({ error: 'Falta la clave (configurá CLAVE_DIAG en Railway y usá ?clave=...)' });
   try {
     const token = await getValidToken(ML_USER_ID);
     if (!token) throw new Error('No hay token de ML disponible');
@@ -2757,7 +2791,7 @@ app.get('/api/despacho/diag', async (req, res) => {
     const desdeISO = desde.toISOString().substring(0,10) + 'T00:00:00.000-03:00';
     const hastaISO = new Date().toISOString().substring(0,10) + 'T23:59:59.000-03:00';
     const ordenes = []; let offset = 0, total = 999;
-    while (offset < Math.min(total, 2000)) {
+    while (offset < Math.min(total, MAX_ORDENES)) {
       const url = `https://api.mercadolibre.com/orders/search?seller=${ML_USER_ID}`
         + `&order.status=paid&order.date_created.from=${encodeURIComponent(desdeISO)}`
         + `&order.date_created.to=${encodeURIComponent(hastaISO)}`
@@ -2986,8 +3020,22 @@ app.post('/api/despacho/full/borrar', async (req, res) => {
   } catch (e) { console.error('[FULL][BORRAR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.47-otros-depositos' }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.48-robustez-seguridad', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;
+
+// ── Purga automática del log de webhooks (dep_webhooks crece sin parar) ──
+const WEBHOOK_DIAS_RETENCION = parseInt(process.env.WEBHOOK_DIAS_RETENCION || '14', 10);
+async function purgarWebhooks() {
+  try {
+    const corte = new Date(Date.now() - WEBHOOK_DIAS_RETENCION * 24 * 60 * 60 * 1000).toISOString();
+    const { error } = await supabase.from('dep_webhooks').delete().lt('received_at', corte);
+    if (error) console.error('[PURGA] dep_webhooks:', error.message);
+    else console.log(`[PURGA] dep_webhooks: eliminado lo anterior a ${corte} (retención ${WEBHOOK_DIAS_RETENCION} días)`);
+  } catch (e) { console.error('[PURGA]', e.message); }
+}
+setTimeout(purgarWebhooks, 60 * 1000);            // una pasada al minuto de arrancar
+setInterval(purgarWebhooks, 6 * 60 * 60 * 1000);  // y después cada 6 horas
+
 app.listen(PORT, () => console.log(`Depósito backend escuchando en :${PORT}`));

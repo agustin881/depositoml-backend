@@ -1312,26 +1312,45 @@ app.get('/api/despacho/depositos-ml', async (req, res) => {
     if (String(req.query.traer || '') === '1') {
       const token = await getValidToken(ML_USER_ID);
       if (!token) throw new Error('No hay token de ML');
-      const r = await fetch(`https://api.mercadolibre.com/users/${ML_USER_ID}/addresses?access_token=${token}`);
-      const dirs = await r.json();
-      if (!Array.isArray(dirs)) throw new Error('ML no devolvió direcciones: ' + JSON.stringify(dirs).slice(0, 200));
-      const filas = dirs.map(d => ({
-        ml_address_id: String(d.id),
-        direccion: [d.address_line, d.city && d.city.name].filter(Boolean).join(' '),
-        ciudad: (d.city && d.city.name) || null,
-        actualizado_at: new Date().toISOString()
-      }));
-      if (filas.length) {
-        // upsert con merge: actualiza dirección/ciudad SIN pisar alias ni es_principal
-        const { error } = await supabase.from('dep_depositos').upsert(filas, { onConflict: 'ml_address_id' });
-        if (error) throw new Error(error.message);
+      let filas = []; let origen = 'ml';
+      // Intento 1: la libreta de direcciones de ML (puede estar bloqueada por políticas de privacidad)
+      try {
+        const r = await fetch(`https://api.mercadolibre.com/users/${ML_USER_ID}/addresses?access_token=${token}`);
+        const dirs = await r.json();
+        if (Array.isArray(dirs)) {
+          filas = dirs.map(d => ({
+            ml_address_id: String(d.id),
+            direccion: [d.address_line, d.city && d.city.name].filter(Boolean).join(' '),
+            ciudad: (d.city && d.city.name) || null,
+            actualizado_at: new Date().toISOString()
+          }));
+        } else {
+          console.warn('[DEPOSITOS-ML] /addresses bloqueado por ML:', JSON.stringify(dirs).slice(0, 160));
+        }
+      } catch (e) { console.warn('[DEPOSITOS-ML] /addresses:', e.message); }
+      // Intento 2 (plan B): cosechar los depósitos de los envíos reales ya recorridos
+      if (!filas.length) {
+        origen = 'envios';
+        const detallados = await obtenerDetalladosConCache(token);
+        const m = new Map();
+        for (const s of detallados) {
+          if (s.dep_id && !m.has(String(s.dep_id))) m.set(String(s.dep_id), s.dep_dir || null);
+        }
+        filas = [...m.entries()].map(([id, dir]) => ({
+          ml_address_id: id, direccion: dir, ciudad: null, actualizado_at: new Date().toISOString()
+        }));
+        if (!filas.length) throw new Error('ML bloqueó la consulta de direcciones y todavía no hay envíos en el caché para cosechar. Tocá "Actualizar ahora" en Imprimir, esperá que termine, y probá de nuevo.');
       }
+      // upsert con merge: actualiza dirección SIN pisar alias ni es_principal
+      const { error } = await supabase.from('dep_depositos').upsert(filas, { onConflict: 'ml_address_id' });
+      if (error) throw new Error(error.message);
       await cargarDepositosCfg();
+      req._origenPesca = origen;
     }
     const { data, error } = await supabase.from('dep_depositos')
       .select('ml_address_id,direccion,ciudad,alias,es_principal').order('es_principal', { ascending: false });
     if (error) throw new Error(error.message);
-    res.json({ depositos: data || [], filtro_texto_activo: !_depCfg.principalId ? (DEPOSITO_FILTRO || null) : null });
+    res.json({ depositos: data || [], origen: req._origenPesca || null, filtro_texto_activo: !_depCfg.principalId ? (DEPOSITO_FILTRO || null) : null });
   } catch (e) { console.error('[DEPOSITOS-ML]', e.message); res.status(500).json({ error: e.message }); }
 });
 
@@ -3108,7 +3127,7 @@ app.post('/api/despacho/full/borrar', async (req, res) => {
   } catch (e) { console.error('[FULL][BORRAR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.49-depositos-vinculados', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.50-pesca-desde-envios', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

@@ -32,6 +32,39 @@ const DIAS_BUSQUEDA    = parseInt(process.env.DIAS_BUSQUEDA || '8', 10);
 const MAX_ORDENES      = parseInt(process.env.MAX_ORDENES || '6000', 10); // tope de ventas a recorrer (20k/mes ≈ 5.300 en 8 días)
 const CLAVE_DIAG       = (process.env.CLAVE_DIAG || '').trim(); // clave de los endpoints diag y oauth/login (SIN valor por defecto: configurala en Railway)
 
+// ── Depósitos vinculados (tabla dep_depositos): ID de ML ↔ alias propio ──
+// Si hay un depósito marcado como principal, el filtro usa el ID EXACTO
+// (robusto: distingue dos depósitos en la misma ciudad). Si no hay ninguno
+// configurado, se usa el filtro por texto DEPOSITO_FILTRO como siempre.
+let _depCfg = { porId: new Map(), principalId: null };
+async function cargarDepositosCfg() {
+  try {
+    const { data, error } = await supabase.from('dep_depositos').select('ml_address_id,alias,direccion,es_principal');
+    if (error) { console.error('[DEPCFG]', error.message); return; }
+    const m = new Map(); let ppal = null;
+    for (const d of (data || [])) {
+      m.set(String(d.ml_address_id), d);
+      if (d.es_principal) ppal = String(d.ml_address_id);
+    }
+    _depCfg = { porId: m, principalId: ppal };
+    console.log(`[DEPCFG] ${m.size} depósito(s) vinculados · principal: ${ppal ? (m.get(ppal).alias || ppal) : '(ninguno → filtro por texto "' + (DEPOSITO_FILTRO || 'desactivado') + '")'}`);
+  } catch (e) { console.error('[DEPCFG]', e.message); }
+}
+setTimeout(cargarDepositosCfg, 3000);
+setInterval(cargarDepositosCfg, 10 * 60 * 1000);
+
+// ¿Este envío sale de nuestro depósito? (por ID si hay principal; si no, por texto)
+function esDeNuestroDeposito(depId, depDir) {
+  if (_depCfg.principalId) return !depId ? true : String(depId) === _depCfg.principalId;
+  if (!DEPOSITO_FILTRO) return true;
+  return !depDir ? true : normalizar(depDir).includes(DEPOSITO_FILTRO) || String(depId || '') === DEPOSITO_FILTRO;
+}
+// Nombre para mostrar: tu alias si existe, si no la dirección de ML
+function nombreDeposito(depId, depDir) {
+  const d = depId ? _depCfg.porId.get(String(depId)) : null;
+  return (d && d.alias) ? d.alias : (depDir || '(sin dirección informada por ML)');
+}
+
 const LOGISTIC = { flex: 'self_service', colecta: 'cross_docking' };
 
 // Solo trabajamos los envíos que salen de NUESTRO depósito (Rosario).
@@ -328,16 +361,14 @@ async function obtenerShipmentsDetallados(token, onLote) {
     return s;
   };
 
-  const pasaFiltro = (s) =>
-    !DEPOSITO_FILTRO ? true
-      : (!s.dep_dir ? true : normalizar(s.dep_dir).includes(DEPOSITO_FILTRO) || s.dep_id === DEPOSITO_FILTRO);
+  const pasaFiltro = (s) => esDeNuestroDeposito(s.dep_id, s.dep_dir);
 
   // Estadísticas por depósito de origen (para verificar qué entra y qué queda afuera)
   const statsDep = new Map();
   const anotarDep = (s, incluido) => {
-    const k = s.dep_dir || '(sin dirección informada por ML)';
+    const k = s.dep_id ? String(s.dep_id) : (s.dep_dir || '(sin dirección)');
     let e = statsDep.get(k);
-    if (!e) { e = { deposito: k, incluidos: 0, excluidos: 0 }; statsDep.set(k, e); }
+    if (!e) { e = { id: s.dep_id ? String(s.dep_id) : null, deposito: nombreDeposito(s.dep_id, s.dep_dir), incluidos: 0, excluidos: 0 }; statsDep.set(k, e); }
     if (incluido) e.incluidos++; else e.excluidos++;
   };
 
@@ -375,8 +406,7 @@ const tipoDeLogistic = lt =>
 function filaEnvio(s) {
   const lt = s.logistic || '';
   const dir = s.dep_dir || '';
-  const esNuestro = !DEPOSITO_FILTRO ? true
-    : (!dir ? true : normalizar(dir).includes(DEPOSITO_FILTRO) || s.dep_id === DEPOSITO_FILTRO);
+  const esNuestro = esDeNuestroDeposito(s.dep_id, dir);
   return {
     shipment_id: String(s.shipment_id),
     nro_venta: s.nro_venta ? String(s.nro_venta) : null,
@@ -467,6 +497,7 @@ const PRECARGA_HASTA = process.env.PRECARGA_HASTA || '19:00';
 const PRECARGA_MIN   = parseInt(process.env.PRECARGA_MINUTOS || '5', 10);
 
 let _envCache = { at: 0, detallados: null };
+function invalidarCacheEnvios() { _envCache = { at: 0, detallados: null }; } // ej.: al cambiar el depósito principal
 
 async function obtenerDetalladosConCache(token, forzar = false) {
   if (!forzar && _envCache.detallados && Date.now() - _envCache.at < CACHE_TTL_MS) {
@@ -506,7 +537,9 @@ async function obtenerEnvios(tipo, deposito) {
   const deLaTanda = detallados
     .filter(s => s.logistic === logisticBuscado)
     .filter(s => depBuscado
-      ? normalizar(s.dep_dir || '') === depBuscado          // depósito puntual pedido
+      ? (/^\d+$/.test(depBuscado)
+          ? String(s.dep_id || '') === depBuscado           // depósito puntual por ID (exacto)
+          : normalizar(s.dep_dir || '') === depBuscado)     // compatibilidad: por dirección
       : s.es_nuestro !== false);                            // por defecto: solo el nuestro
 
   // Criterio (copiando a ML): "listo para imprimir" = substatus
@@ -1270,6 +1303,61 @@ app.get('/api/despacho/depositos', async (_req, res) => {
       if (token) await obtenerDetalladosConCache(token); // fuerza una pasada si nunca corrió
     }
     res.json(_depositosStats || { filtro: DEPOSITO_FILTRO || '(desactivado: entra todo)', depositos: [], actualizado: null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Depósitos vinculados: pescar de ML, poner alias y elegir principal ──
+app.get('/api/despacho/depositos-ml', async (req, res) => {
+  try {
+    if (String(req.query.traer || '') === '1') {
+      const token = await getValidToken(ML_USER_ID);
+      if (!token) throw new Error('No hay token de ML');
+      const r = await fetch(`https://api.mercadolibre.com/users/${ML_USER_ID}/addresses?access_token=${token}`);
+      const dirs = await r.json();
+      if (!Array.isArray(dirs)) throw new Error('ML no devolvió direcciones: ' + JSON.stringify(dirs).slice(0, 200));
+      const filas = dirs.map(d => ({
+        ml_address_id: String(d.id),
+        direccion: [d.address_line, d.city && d.city.name].filter(Boolean).join(' '),
+        ciudad: (d.city && d.city.name) || null,
+        actualizado_at: new Date().toISOString()
+      }));
+      if (filas.length) {
+        // upsert con merge: actualiza dirección/ciudad SIN pisar alias ni es_principal
+        const { error } = await supabase.from('dep_depositos').upsert(filas, { onConflict: 'ml_address_id' });
+        if (error) throw new Error(error.message);
+      }
+      await cargarDepositosCfg();
+    }
+    const { data, error } = await supabase.from('dep_depositos')
+      .select('ml_address_id,direccion,ciudad,alias,es_principal').order('es_principal', { ascending: false });
+    if (error) throw new Error(error.message);
+    res.json({ depositos: data || [], filtro_texto_activo: !_depCfg.principalId ? (DEPOSITO_FILTRO || null) : null });
+  } catch (e) { console.error('[DEPOSITOS-ML]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/despacho/depositos-ml/alias', async (req, res) => {
+  try {
+    const id = String((req.body && req.body.ml_address_id) || '').trim();
+    const alias = String((req.body && req.body.alias) || '').trim();
+    if (!id) return res.status(400).json({ error: 'Falta el ID del depósito' });
+    const { error } = await supabase.from('dep_depositos').update({ alias: alias || null }).eq('ml_address_id', id);
+    if (error) throw new Error(error.message);
+    await cargarDepositosCfg();
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/despacho/depositos-ml/principal', async (req, res) => {
+  try {
+    const id = String((req.body && req.body.ml_address_id) || '').trim();
+    if (!id) return res.status(400).json({ error: 'Falta el ID del depósito' });
+    const { error: e1 } = await supabase.from('dep_depositos').update({ es_principal: false }).neq('ml_address_id', '~');
+    if (e1) throw new Error(e1.message);
+    const { error: e2 } = await supabase.from('dep_depositos').update({ es_principal: true }).eq('ml_address_id', id);
+    if (e2) throw new Error(e2.message);
+    await cargarDepositosCfg();
+    invalidarCacheEnvios();
+    res.json({ ok: true, principal: id });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -3020,7 +3108,7 @@ app.post('/api/despacho/full/borrar', async (req, res) => {
   } catch (e) { console.error('[FULL][BORRAR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.48-robustez-seguridad', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.49-depositos-vinculados', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

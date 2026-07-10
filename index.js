@@ -2406,10 +2406,15 @@ app.get('/api/despacho/despachados', async (_req, res) => {
     const despIds = new Set((desp || []).map(r => r.shipment_id));
 
     let aDespachar = [];
+    const programadas = new Map(); // ventas con despacho programado para otro día: NO cuentan como faltantes de hoy
     for (const s of foto) {
       if (s.cancelada || TERMINADOS.includes(s.status) || EN_RED.has(s.substatus)) continue; // ya salió
       const pbDay = s.pay_before ? String(s.pay_before).substring(0, 10) : null;
       if (pbDay && pbDay > hoy) continue;   // es para mañana/futuro → no es del día
+      if (s.substatus === 'buffered') {     // ML la tiene "en espera" para una colecta futura (ej. entregar el 13)
+        if (!despIds.has(s.shipment_id)) programadas.set(s.shipment_id, { ...s, fecha_programada: pbDay });
+        continue;
+      }
       aDespachar.push(s);
     }
 
@@ -2428,9 +2433,17 @@ app.get('/api/despacho/despachados', async (_req, res) => {
           const sh = await r.json();
           const cancel = sh.status === 'cancelled' || (sh.substatus === 'cancelled');
           const yaSalio = TERMINADOS.includes(sh.status) || EN_RED.has(sh.substatus);
+          // ¿Está programada para otro día? (colectas futuras: substatus buffered o fecha de despacho > hoy)
+          const hl = sh.shipping_option && sh.shipping_option.estimated_handling_limit && sh.shipping_option.estimated_handling_limit.date;
+          const hDay = hl ? String(hl).substring(0, 10) : null;
+          const esProgramada = sh.substatus === 'buffered' || (hDay && hDay > hoy);
           if (cancel || yaSalio) {
             fuera.add(s.shipment_id);
             try { await supabase.from('dep_envios').update({ status: sh.status, substatus: sh.substatus || null, cancelada: cancel }).eq('shipment_id', s.shipment_id); } catch (_) {}
+          } else if (esProgramada) {
+            fuera.add(s.shipment_id);
+            programadas.set(s.shipment_id, { ...s, fecha_programada: hDay });
+            try { await supabase.from('dep_envios').update({ substatus: sh.substatus || null }).eq('shipment_id', s.shipment_id); } catch (_) {}
           }
         } catch (_) {}
       });
@@ -2452,6 +2465,8 @@ app.get('/api/despacho/despachados', async (_req, res) => {
       impresas_hoy: impUnicas.size,
       despachadas_hoy: despIds.size,
       faltan_cnt: faltan.length,
+      programadas_cnt: programadas.size,
+      programadas: [...programadas.values()].sort((a, b) => String(a.fecha_programada || '9999').localeCompare(String(b.fecha_programada || '9999'))),
       por_tipo: porTipo,
       faltan,
       despachadas: desp || []
@@ -3127,7 +3142,7 @@ app.post('/api/despacho/full/borrar', async (req, res) => {
   } catch (e) { console.error('[FULL][BORRAR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.50-pesca-desde-envios', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.51-programadas-separadas', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

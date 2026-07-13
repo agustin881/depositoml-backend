@@ -349,8 +349,9 @@ async function obtenerShipmentsDetallados(token, onLote) {
       s.status   = ship.status || '';
       s.substatus = ship.substatus || '';
       s.logistic = ship.logistic_type || (ship.logistic && ship.logistic.type) || '';
-      s.limite   = (ship.shipping_option && ship.shipping_option.estimated_handling_limit
-                    && ship.shipping_option.estimated_handling_limit.date) || null;
+      s.limite   = (ship.shipping_option && ((ship.shipping_option.estimated_handling_limit
+                    && ship.shipping_option.estimated_handling_limit.date)
+                    || (ship.shipping_option.buffering && ship.shipping_option.buffering.date))) || null;
       s.pay_before = (ship.shipping_option && ship.shipping_option.estimated_delivery_time
                     && ship.shipping_option.estimated_delivery_time.pay_before) || null;
       s.date_handling = (ship.status_history && ship.status_history.date_handling) || null;
@@ -441,8 +442,9 @@ async function actualizarFotoEnvio(shipmentId, token) {
       status: ship.status || '',
       substatus: ship.substatus || '',
       logistic: ship.logistic_type || (ship.logistic && ship.logistic.type) || '',
-      limite: (ship.shipping_option && ship.shipping_option.estimated_handling_limit
-               && ship.shipping_option.estimated_handling_limit.date) || null,
+      limite: (ship.shipping_option && ((ship.shipping_option.estimated_handling_limit
+               && ship.shipping_option.estimated_handling_limit.date)
+               || (ship.shipping_option.buffering && ship.shipping_option.buffering.date))) || null,
       pay_before: (ship.shipping_option && ship.shipping_option.estimated_delivery_time
                && ship.shipping_option.estimated_delivery_time.pay_before) || null,
       date_handling: (ship.status_history && ship.status_history.date_handling) || null,
@@ -2444,7 +2446,9 @@ app.get('/api/despacho/despachados', async (_req, res) => {
           const cancel = sh.status === 'cancelled' || (sh.substatus === 'cancelled');
           const yaSalio = TERMINADOS.includes(sh.status) || EN_RED.has(sh.substatus);
           // ¿Está programada para otro día? (colectas futuras: substatus buffered o fecha de despacho > hoy)
-          const hl = sh.shipping_option && sh.shipping_option.estimated_handling_limit && sh.shipping_option.estimated_handling_limit.date;
+          const so2 = sh.shipping_option || {};
+          const hl = (so2.estimated_handling_limit && so2.estimated_handling_limit.date)
+                   || (so2.buffering && so2.buffering.date) || null;
           const hDay = hl ? String(hl).substring(0, 10) : null;
           const esProgramada = sh.substatus === 'buffered' || (hDay && hDay > hoy);
           if (cancel || yaSalio) {
@@ -3152,7 +3156,7 @@ app.post('/api/despacho/full/borrar', async (req, res) => {
   } catch (e) { console.error('[FULL][BORRAR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.52-corte-fecha-real', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.53-fecha-buffering', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

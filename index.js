@@ -896,6 +896,11 @@ function cuandoDespacho(s, hoy, corteCol) {
   if (pb && pb > hoy) return 'manana';        // corte a futuro
   if (pb && pb === hoy) return 'hoy';          // corte de hoy
   // pay_before viejo (anterior a hoy) o sin dato:
+  // 1) Si ML informa la fecha real de despacho (estimated_handling_limit) y es futura,
+  //    la colecta lo lleva otro día (típico de ventas programadas recién liberadas).
+  const lim = s.limite ? String(s.limite).substring(0, 10) : null;
+  if (lim && lim > hoy) return 'manana';
+  // 2) Colecta liberada hoy después del corte → mañana
   if (s.tipo === 'colecta' && corteCol && corteCol.corte && s.date_handling) {
     const libDia = fechaDeART(s.date_handling);
     if (libDia === hoy) {
@@ -2390,7 +2395,7 @@ app.get('/api/despacho/despachados', async (_req, res) => {
     let foto = [], from = 0;
     while (true) {
       const { data, error: e2 } = await supabase.from('dep_envios')
-        .select('shipment_id,nro_venta,sku,titulo,tipo,status,substatus,pay_before,cancelada')
+        .select('shipment_id,nro_venta,sku,titulo,tipo,status,substatus,pay_before,limite,cancelada')
         .eq('es_nuestro', true).in('tipo', ['flex', 'colecta'])
         .range(from, from + 999);
       if (e2) throw new Error(e2.message);
@@ -2413,6 +2418,11 @@ app.get('/api/despacho/despachados', async (_req, res) => {
       if (pbDay && pbDay > hoy) continue;   // es para mañana/futuro → no es del día
       if (s.substatus === 'buffered') {     // ML la tiene "en espera" para una colecta futura (ej. entregar el 13)
         if (!despIds.has(s.shipment_id)) programadas.set(s.shipment_id, { ...s, fecha_programada: pbDay });
+        continue;
+      }
+      const limDay = s.limite ? String(s.limite).substring(0, 10) : null;
+      if (limDay && limDay > hoy) {         // la fecha real de despacho (ML) es futura → programada
+        if (!despIds.has(s.shipment_id)) programadas.set(s.shipment_id, { ...s, fecha_programada: limDay });
         continue;
       }
       aDespachar.push(s);
@@ -3142,7 +3152,7 @@ app.post('/api/despacho/full/borrar', async (req, res) => {
   } catch (e) { console.error('[FULL][BORRAR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.51-programadas-separadas', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.52-corte-fecha-real', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

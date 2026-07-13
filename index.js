@@ -135,6 +135,28 @@ const TRANSPORTISTAS_FLEX = (process.env.FLEX_TRANSPORTISTAS || 'Ruedo,Gustavo')
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ── Middleware: exige usuario logueado (token de Supabase) ────────
+// ── Registro central Pontec OS: valida rol/apps contra MargenML (/api/mi-rol) ──
+const MARGEN_BACKEND = (process.env.MARGEN_BACKEND_URL || 'https://margenml-backend-production.up.railway.app').replace(/\/$/, '');
+const _rolCache = new Map(); // email → { t, ok, rol }  (caché 5 min para no pegarle en cada request)
+async function accesoLogisticaCentral(token, email) {
+  const c = _rolCache.get(email);
+  if (c && Date.now() - c.t < 5 * 60 * 1000) return c;
+  const out = { t: Date.now(), ok: null, rol: null }; // ok=null → central no disponible
+  try {
+    const r = await fetch(`${MARGEN_BACKEND}/api/mi-rol`, { headers: { Authorization: `Bearer ${token}` } });
+    if (r.ok) {
+      const d = await r.json();
+      if (d && d.rol) {
+        out.rol = d.rol;
+        const apps = (d.apps && d.apps.length) ? d.apps : null; // sin lista propia → apps según rol (todas incluyen logística)
+        out.ok = apps ? apps.includes('logistica') : true;
+      } else out.ok = false; // el central respondió pero el usuario no está registrado
+    }
+  } catch (e) { /* central caído → out.ok queda null y usamos el fallback */ }
+  _rolCache.set(email, out);
+  return out;
+}
+
 async function requireAuth(req, res, next) {
   try {
     // Excepción temporal: diagnóstico accesible con clave en la URL (para debug)
@@ -145,6 +167,13 @@ async function requireAuth(req, res, next) {
     const { data, error } = await supabase.auth.getUser(token);
     if (error || !data || !data.user) return res.status(401).json({ error: 'Sesión inválida' });
     const email = (data.user.email || '').toLowerCase();
+
+    // 1) Registro central de Pontec OS (mismos usuarios y roles que el hub)
+    const acceso = await accesoLogisticaCentral(token, email);
+    if (acceso.ok === true) { req.authUser = data.user; req.rol = acceso.rol; return next(); }
+    if (acceso.ok === false) return res.status(403).json({ error: 'Tu usuario no tiene acceso a Logística en Pontec OS (pedile al admin que te lo habilite en Usuarios)' });
+
+    // 2) Central no disponible → fallback a la lista local de siempre (EMAILS_DEPOSITO)
     if (EMAILS_DEPOSITO.length && !EMAILS_DEPOSITO.includes(email)) {
       return res.status(403).json({ error: 'Tu usuario no tiene acceso al depósito' });
     }
@@ -3162,7 +3191,7 @@ app.post('/api/despacho/full/borrar', async (req, res) => {
   } catch (e) { console.error('[FULL][BORRAR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.54-franja-veraz', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.55-registro-pontecos', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

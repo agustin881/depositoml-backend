@@ -393,7 +393,13 @@ async function obtenerShipmentsDetallados(token, onLote) {
     await sleep(120);
   }
   if (afuera) console.log(`[ENVIOS] ${afuera} envío(s) de otro depósito quedaron afuera`);
-  _depositosStats = { filtro: DEPOSITO_FILTRO || '(desactivado: entra todo)', depositos: [...statsDep.values()].sort((a,b)=>b.incluidos-a.incluidos || b.excluidos-a.excluidos), actualizado: new Date().toISOString() };
+  const modoFiltro = _depCfg.principalId
+    ? `${nombreDeposito(_depCfg.principalId, null)} — por ID exacto`
+    : (DEPOSITO_FILTRO ? `texto "${DEPOSITO_FILTRO}"` : '(desactivado: entra todo)');
+  _depositosStats = { filtro: modoFiltro, modo: _depCfg.principalId ? 'principal' : 'texto',
+    depositos: [...statsDep.values()].map(e => ({ ...e, es_principal: !!(_depCfg.principalId && e.id === _depCfg.principalId) }))
+      .sort((a,b)=>b.incluidos-a.incluidos || b.excluidos-a.excluidos),
+    actualizado: new Date().toISOString() };
   return todos;
 }
 
@@ -3156,7 +3162,7 @@ app.post('/api/despacho/full/borrar', async (req, res) => {
   } catch (e) { console.error('[FULL][BORRAR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.53-fecha-buffering', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.54-franja-veraz', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

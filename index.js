@@ -3191,7 +3191,156 @@ app.post('/api/despacho/full/borrar', async (req, res) => {
   } catch (e) { console.error('[FULL][BORRAR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.55-registro-pontecos', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
+// ══════════════════════════════════════════════════════════════════
+//  TRANSPORTES FLEX · cuántos envíos llevó cada transportista (Ruedo,
+//  Gustavo, ...), a qué tarifa, y cierres de pago contra factura.
+//  Fuente: dep_despachos (tipo=flex, campo transportista).
+// ══════════════════════════════════════════════════════════════════
+
+const diaART = (ts) => new Date(new Date(ts).getTime() - 3 * 3600 * 1000).toISOString().substring(0, 10);
+
+// Trae los despachos flex de un transportista en un rango (paginado)
+async function despachosFlexDe(transportista, desde, hasta) {
+  let out = [], from = 0; const size = 1000;
+  for (;;) {
+    const { data, error } = await supabase.from('dep_despachos')
+      .select('shipment_id,despachado_at')
+      .eq('tipo', 'flex').eq('transportista', transportista)
+      .gte('despachado_at', `${desde}T00:00:00.000-03:00`)
+      .lte('despachado_at', `${hasta}T23:59:59.999-03:00`)
+      .order('despachado_at', { ascending: true })
+      .range(from, from + size - 1);
+    if (error) throw new Error(error.message);
+    out = out.concat(data || []);
+    if (!data || data.length < size) break;
+    from += size;
+    if (from > 40000) break;
+  }
+  return out;
+}
+
+// Resumen por transportista: período pendiente, envíos, desglose por día y total
+app.get('/api/despacho/transportes/resumen', async (req, res) => {
+  try {
+    const hasta = (req.query.hasta || '').trim() || fechaHoyART();
+    const soloDe = (req.query.transportista || '').trim() || null;
+    const desdeParam = (req.query.desde || '').trim() || null;
+
+    const { data: tarifas } = await supabase.from('dep_transporte_tarifas').select('*');
+    const { data: cierres } = await supabase.from('dep_transporte_cierres')
+      .select('transportista,hasta').order('hasta', { ascending: false });
+    const tarifaDe = new Map((tarifas || []).map(t => [t.transportista, Number(t.tarifa) || 0]));
+    const ultimoCierre = new Map();
+    for (const c of (cierres || [])) if (!ultimoCierre.has(c.transportista)) ultimoCierre.set(c.transportista, c.hasta);
+
+    // Transportistas = los configurados + los que aparezcan con tarifa/cierre
+    const nombres = new Set(TRANSPORTISTAS_FLEX);
+    for (const t of tarifaDe.keys()) nombres.add(t);
+    for (const t of ultimoCierre.keys()) nombres.add(t);
+
+    const lista = [];
+    for (const nombre of nombres) {
+      if (soloDe && nombre !== soloDe) continue;
+      // desde: el día siguiente al último cierre; si nunca cerró, su primer despacho
+      let desde = desdeParam;
+      if (!desde) {
+        const uc = ultimoCierre.get(nombre);
+        if (uc) {
+          const d = new Date(uc + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() + 1);
+          desde = d.toISOString().substring(0, 10);
+        } else {
+          const { data: pri } = await supabase.from('dep_despachos')
+            .select('despachado_at').eq('tipo', 'flex').eq('transportista', nombre)
+            .order('despachado_at', { ascending: true }).limit(1);
+          desde = (pri && pri[0]) ? diaART(pri[0].despachado_at) : hasta;
+        }
+      }
+      let envios = [], errorRango = null;
+      if (desde <= hasta) { try { envios = await despachosFlexDe(nombre, desde, hasta); } catch (e) { errorRango = e.message; } }
+      const porDia = new Map();
+      for (const e of envios) { const d = diaART(e.despachado_at); porDia.set(d, (porDia.get(d) || 0) + 1); }
+      const tarifa = tarifaDe.get(nombre) || 0;
+      lista.push({
+        transportista: nombre, tarifa,
+        ultimo_cierre_hasta: ultimoCierre.get(nombre) || null,
+        desde, hasta, envios: envios.length,
+        total: Math.round(envios.length * tarifa * 100) / 100,
+        por_dia: [...porDia.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([dia, n]) => ({ dia, envios: n })),
+        error: errorRango
+      });
+    }
+    lista.sort((a, b) => b.envios - a.envios || a.transportista.localeCompare(b.transportista));
+    res.json({ transportistas: lista, hoy: fechaHoyART() });
+  } catch (e) { console.error('[TRANSPORTES]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Guardar la tarifa por envío de una empresa
+app.post('/api/despacho/transportes/tarifa', async (req, res) => {
+  try {
+    const transportista = String((req.body && req.body.transportista) || '').trim();
+    const tarifa = Number((req.body && req.body.tarifa));
+    if (!transportista || !isFinite(tarifa) || tarifa < 0) return res.status(400).json({ error: 'Datos inválidos' });
+    const { error } = await supabase.from('dep_transporte_tarifas')
+      .upsert({ transportista, tarifa, actualizado_at: new Date().toISOString() }, { onConflict: 'transportista' });
+    if (error) throw new Error(error.message);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Cerrar un período: recuenta en el servidor, valida solapamiento y lo marca PAGADO
+app.post('/api/despacho/transportes/cerrar', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const transportista = String(b.transportista || '').trim();
+    const desde = String(b.desde || '').trim(), hasta = String(b.hasta || '').trim();
+    if (!transportista || !/^\d{4}-\d{2}-\d{2}$/.test(desde) || !/^\d{4}-\d{2}-\d{2}$/.test(hasta) || desde > hasta)
+      return res.status(400).json({ error: 'Período inválido' });
+    // sin solapamientos con cierres ya pagados
+    const { data: sol } = await supabase.from('dep_transporte_cierres')
+      .select('id,desde,hasta').eq('transportista', transportista)
+      .lte('desde', hasta).gte('hasta', desde).limit(1);
+    if (sol && sol.length)
+      return res.status(409).json({ error: `Ese período se pisa con un cierre ya pagado (${sol[0].desde} → ${sol[0].hasta})` });
+    let tarifa = Number(b.tarifa);
+    if (!isFinite(tarifa) || tarifa < 0) {
+      const { data: t } = await supabase.from('dep_transporte_tarifas').select('tarifa').eq('transportista', transportista).limit(1);
+      tarifa = (t && t[0]) ? Number(t[0].tarifa) : 0;
+    }
+    const envios = (await despachosFlexDe(transportista, desde, hasta)).length;   // recuento del servidor: fuente de verdad
+    const total = Math.round(envios * tarifa * 100) / 100;
+    const { data: ins, error } = await supabase.from('dep_transporte_cierres').insert({
+      transportista, desde, hasta, envios, tarifa, total,
+      factura: (b.factura || '').trim() || null, notas: (b.notas || '').trim() || null,
+      usuario: (req.authUser && req.authUser.email) || null
+    }).select();
+    if (error) throw new Error(error.message);
+    console.log(`[TRANSPORTES] cierre ${transportista} ${desde}→${hasta}: ${envios} envíos × $${tarifa} = $${total}`);
+    res.json({ ok: true, cierre: ins && ins[0] });
+  } catch (e) { console.error('[TRANSPORTES][CERRAR]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Historial de cierres (pagos hechos)
+app.get('/api/despacho/transportes/cierres', async (_req, res) => {
+  try {
+    const { data, error } = await supabase.from('dep_transporte_cierres')
+      .select('*').order('pagado_at', { ascending: false }).limit(200);
+    if (error) throw new Error(error.message);
+    res.json({ cierres: data || [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Deshacer un cierre (si se cargó mal)
+app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
+  try {
+    const id = Number((req.body && req.body.id));
+    if (!id) return res.status(400).json({ error: 'Falta el id' });
+    const { error } = await supabase.from('dep_transporte_cierres').delete().eq('id', id);
+    if (error) throw new Error(error.message);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.56-transportes', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

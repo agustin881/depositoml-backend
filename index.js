@@ -1440,6 +1440,145 @@ app.post('/api/despacho/depositos-ml/principal', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ══════════════════════════════════════════════════════════════════
+//  VERIFICACIÓN DE PRODUCTOS · catálogo SKU↔EAN + llave en Ajustes.
+//  Con la llave activada, al escanear una etiqueta cuyo producto
+//  requiere verificación, se pide escanear el EAN antes de registrar.
+// ══════════════════════════════════════════════════════════════════
+let _verifCfg = { on: false, t: 0 };
+let _prodCache = { map: null, t: 0 };
+
+async function verifProductosOn() {
+  if (Date.now() - _verifCfg.t < 60000) return _verifCfg.on;
+  try {
+    const { data } = await supabase.from('dep_ajustes').select('valor').eq('clave', 'verif_productos').limit(1);
+    _verifCfg = { on: !!(data && data[0] && data[0].valor === 'on'), t: Date.now() };
+  } catch (e) { _verifCfg.t = Date.now(); }
+  return _verifCfg.on;
+}
+
+async function catalogoProductos() {
+  if (_prodCache.map && Date.now() - _prodCache.t < 60000) return _prodCache.map;
+  const m = new Map(); const porEan = new Map(); let from = 0; const size = 1000;
+  for (;;) {
+    const { data, error } = await supabase.from('dep_productos')
+      .select('sku,ean,requiere').range(from, from + size - 1);
+    if (error) break;
+    for (const p of (data || [])) {
+      m.set(String(p.sku).trim().toUpperCase(), p);
+      if (p.ean) porEan.set(String(p.ean).replace(/[^0-9]/g, ''), p);
+    }
+    if (!data || data.length < size) break;
+    from += size; if (from > 20000) break;
+  }
+  _prodCache = { map: m, porEan, t: Date.now() };
+  return m;
+}
+
+// Estado de la llave + resumen del catálogo
+app.get('/api/despacho/verificacion', async (_req, res) => {
+  try {
+    _verifCfg.t = 0; const on = await verifProductosOn();
+    _prodCache.t = 0; const m = await catalogoProductos();
+    let req_ = 0; for (const p of m.values()) if (p.requiere) req_++;
+    res.json({ on, total: m.size, requieren: req_ });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Prender/apagar la llave general
+app.post('/api/despacho/verificacion', async (req, res) => {
+  try {
+    const on = !!(req.body && req.body.on);
+    const { error } = await supabase.from('dep_ajustes')
+      .upsert({ clave: 'verif_productos', valor: on ? 'on' : 'off' }, { onConflict: 'clave' });
+    if (error) throw new Error(error.message);
+    _verifCfg = { on, t: Date.now() };
+    console.log(`[VERIF] verificación de productos: ${on ? 'ACTIVADA' : 'desactivada'} por ${(req.authUser && req.authUser.email) || '?'}`);
+    res.json({ ok: true, on });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Listar/buscar productos del catálogo
+app.get('/api/despacho/productos', async (req, res) => {
+  try {
+    const buscar = (req.query.buscar || '').trim();
+    let q = supabase.from('dep_productos').select('sku,ean,requiere').order('sku').limit(120);
+    if (buscar) q = q.or(`sku.ilike.%${buscar}%,ean.ilike.%${buscar}%`);
+    const { data, error } = await q;
+    if (error) throw new Error(error.message);
+    res.json({ productos: data || [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Importación masiva: una línea por producto → SKU [tab/;/,] EAN [tab/;/, no]
+app.post('/api/despacho/productos/importar', async (req, res) => {
+  try {
+    const texto = String((req.body && req.body.texto) || '');
+    const filas = []; let invalidas = 0;
+    for (const lineaRaw of texto.split(/\r?\n/)) {
+      const linea = lineaRaw.trim(); if (!linea) continue;
+      const partes = linea.split(/[	;,]+|\s{2,}/).map(x => x.trim()).filter(Boolean);
+      if (partes.length === 1) { // solo SKU, sin EAN aún
+        filas.push({ sku: partes[0].toUpperCase(), ean: null, requiere: true }); continue;
+      }
+      const sku = partes[0].toUpperCase();
+      const ean = (partes[1] || '').replace(/\D/g, '') || null;
+      const tercero = (partes[2] || '').toLowerCase();
+      const requiere = !(tercero === 'no' || tercero === '0' || tercero === 'false');
+      if (!sku) { invalidas++; continue; }
+      filas.push({ sku, ean, requiere, actualizado_at: new Date().toISOString() });
+    }
+    if (!filas.length) return res.status(400).json({ error: 'No encontré líneas válidas (formato: SKU  EAN por línea)' });
+    // upsert de a 500
+    for (let i = 0; i < filas.length; i += 500) {
+      const { error } = await supabase.from('dep_productos').upsert(filas.slice(i, i + 500), { onConflict: 'sku' });
+      if (error) throw new Error(error.message);
+    }
+    _prodCache.t = 0;
+    console.log(`[VERIF] importados ${filas.length} producto(s)`);
+    res.json({ ok: true, importados: filas.length, invalidas });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Alta/edición individual
+app.post('/api/despacho/productos/uno', async (req, res) => {
+  try {
+    const sku = String((req.body && req.body.sku) || '').trim().toUpperCase();
+    if (!sku) return res.status(400).json({ error: 'Falta el SKU' });
+    const ean = String((req.body && req.body.ean) || '').replace(/\D/g, '') || null;
+    const requiere = (req.body && 'requiere' in req.body) ? !!req.body.requiere : true;
+    const { error } = await supabase.from('dep_productos')
+      .upsert({ sku, ean, requiere, actualizado_at: new Date().toISOString() }, { onConflict: 'sku' });
+    if (error) throw new Error(error.message);
+    _prodCache.t = 0;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Cambiar solo el "requiere" de un SKU
+app.post('/api/despacho/productos/requiere', async (req, res) => {
+  try {
+    const sku = String((req.body && req.body.sku) || '').trim().toUpperCase();
+    const requiere = !!(req.body && req.body.requiere);
+    if (!sku) return res.status(400).json({ error: 'Falta el SKU' });
+    const { error } = await supabase.from('dep_productos').update({ requiere }).eq('sku', sku);
+    if (error) throw new Error(error.message);
+    _prodCache.t = 0;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/despacho/productos/borrar', async (req, res) => {
+  try {
+    const sku = String((req.body && req.body.sku) || '').trim().toUpperCase();
+    if (!sku) return res.status(400).json({ error: 'Falta el SKU' });
+    const { error } = await supabase.from('dep_productos').delete().eq('sku', sku);
+    if (error) throw new Error(error.message);
+    _prodCache.t = 0;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Qué pestañas de Logística ve este usuario (resueltas por requireAuth)
 app.get('/api/despacho/mis-pestanas', (req, res) => {
   res.json({ rol: req.rol || null, pestanas: req.pestLog || [] });
@@ -2293,6 +2432,21 @@ app.post('/api/despacho/despachar', async (req, res) => {
   try {
     const codigo = ((req.body && req.body.codigo) || '').trim();
     if (!codigo) return res.status(400).json({ error: 'Falta el código escaneado' });
+
+    // ¿Escanearon un PRODUCTO (EAN del catálogo)? → modo "producto primero":
+    // lo devolvemos como producto en mano, sin tocar nada más.
+    try {
+      if (!codigo.startsWith('{') && await verifProductosOn()) {
+        const dig = codigo.replace(/[^0-9]/g, '');
+        if (dig.length >= 8 && dig.length <= 14) {
+          await catalogoProductos();
+          const p = _prodCache.porEan ? _prodCache.porEan.get(dig) : null;
+          if (p) return res.json({ resultado: 'producto', sku: p.sku, ean: p.ean || null,
+            mensaje: 'Producto en mano — ahora escaneá la etiqueta del paquete' });
+        }
+      }
+    } catch (e) { /* si falla, sigue el flujo normal */ }
+
     const token = await getValidToken(ML_USER_ID);
     if (!token) throw new Error('No hay token de ML disponible');
 
@@ -2394,6 +2548,36 @@ app.post('/api/despacho/despachar', async (req, res) => {
     if (dup && dup[0]) {
       return res.json({ resultado: 'duplicada', mensaje: 'Este envío ya estaba escaneado',
         despachado_at: dup[0].despachado_at, usuario: dup[0].usuario || '', ...base });
+    }
+
+    // ── Verificación de producto (llave en Ajustes): si el SKU la requiere,
+    //    NO registramos todavía: pedimos escanear el EAN del producto.
+    if (!(req.body && req.body.verificado)) {
+      try {
+        if (await verifProductosOn()) {
+          const cat = await catalogoProductos();
+          const p = s.sku ? cat.get(String(s.sku).trim().toUpperCase()) : null;
+          if (p && p.requiere) {
+            // ¿Vino un producto en mano (escaneado antes que la etiqueta)?
+            const manoEan = String((req.body && req.body.producto_ean) || '').replace(/[^0-9]/g, '');
+            const manoSku = String((req.body && req.body.producto_sku) || '').trim().toUpperCase();
+            const coincide = (manoEan && p.ean && manoEan === String(p.ean).replace(/[^0-9]/g, ''))
+                          || (manoSku && manoSku === p.sku);
+            if (!coincide) {
+              if (manoEan || manoSku) {
+                return res.json({ resultado: 'producto_distinto',
+                  mensaje: 'El producto en mano NO corresponde a esta etiqueta',
+                  esperado_sku: p.sku, esperado_ean: p.ean || null,
+                  en_mano_sku: manoSku || null, ...base });
+              }
+              return res.json({ resultado: 'verificar',
+                mensaje: 'Verificá el producto: escaneá su código de barras (EAN)',
+                ean: p.ean || null, ...base });
+            }
+            // producto en mano correcto → sigue y registra
+          }
+        }
+      } catch (e) { /* si falla la config, no frenamos el despacho */ }
     }
 
     // Snapshot de la colecta del día para esta tanda
@@ -3363,7 +3547,7 @@ app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.57-permisos-pestanas', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.59-verif-cualquier-orden', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

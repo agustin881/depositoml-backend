@@ -150,11 +150,19 @@ async function accesoLogisticaCentral(token, email) {
         out.rol = d.rol;
         const apps = (d.apps && d.apps.length) ? d.apps : null; // sin lista propia → apps según rol (todas incluyen logística)
         out.ok = apps ? apps.includes('logistica') : true;
+        out.pest = (d.pestanas_logistica && d.pestanas_logistica.length) ? d.pestanas_logistica : null;
       } else out.ok = false; // el central respondió pero el usuario no está registrado
     }
   } catch (e) { /* central caído → out.ok queda null y usamos el fallback */ }
   _rolCache.set(email, out);
   return out;
+}
+
+// Pestañas de Logística por defecto según el rol (igual que el hub)
+function pestLogPorRol(rol) {
+  if (rol === 'admin') return ['imprimir','despachar','seguimiento','full','pagos','config'];
+  if (rol === 'encargado') return ['imprimir','despachar','seguimiento','full','config'];
+  return ['imprimir','despachar','seguimiento'];
 }
 
 async function requireAuth(req, res, next) {
@@ -170,14 +178,24 @@ async function requireAuth(req, res, next) {
 
     // 1) Registro central de Pontec OS (mismos usuarios y roles que el hub)
     const acceso = await accesoLogisticaCentral(token, email);
-    if (acceso.ok === true) { req.authUser = data.user; req.rol = acceso.rol; return next(); }
     if (acceso.ok === false) return res.status(403).json({ error: 'Tu usuario no tiene acceso a Logística en Pontec OS (pedile al admin que te lo habilite en Usuarios)' });
-
-    // 2) Central no disponible → fallback a la lista local de siempre (EMAILS_DEPOSITO)
-    if (EMAILS_DEPOSITO.length && !EMAILS_DEPOSITO.includes(email)) {
-      return res.status(403).json({ error: 'Tu usuario no tiene acceso al depósito' });
+    if (acceso.ok === true) {
+      req.authUser = data.user; req.rol = acceso.rol;
+      req.pestLog = (acceso.pest && acceso.pest.length) ? acceso.pest : pestLogPorRol(acceso.rol);
+    } else {
+      // Central no disponible → fallback a la lista local (EMAILS_DEPOSITO),
+      // con todas las pestañas MENOS Pagos (la sensible queda protegida)
+      if (EMAILS_DEPOSITO.length && !EMAILS_DEPOSITO.includes(email)) {
+        return res.status(403).json({ error: 'Tu usuario no tiene acceso al depósito' });
+      }
+      req.authUser = data.user; req.rol = null;
+      req.pestLog = ['imprimir','despachar','seguimiento','full','config'];
     }
-    req.authUser = data.user;
+    // Bloqueo en el servidor de las secciones sensibles (además de ocultarlas en pantalla)
+    if (req.path.startsWith('/transportes') && !req.pestLog.includes('pagos'))
+      return res.status(403).json({ error: 'Sin acceso a Pagos de envíos (se habilita en Pontec OS → Usuarios)' });
+    if (req.path.startsWith('/full') && !req.pestLog.includes('full'))
+      return res.status(403).json({ error: 'Sin acceso a Envíos Full (se habilita en Pontec OS → Usuarios)' });
     next();
   } catch (e) { return res.status(401).json({ error: 'No autorizado' }); }
 }
@@ -1420,6 +1438,11 @@ app.post('/api/despacho/depositos-ml/principal', async (req, res) => {
     invalidarCacheEnvios();
     res.json({ ok: true, principal: id });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Qué pestañas de Logística ve este usuario (resueltas por requireAuth)
+app.get('/api/despacho/mis-pestanas', (req, res) => {
+  res.json({ rol: req.rol || null, pestanas: req.pestLog || [] });
 });
 
 app.get('/api/despacho/pendientes', async (req, res) => {
@@ -3340,7 +3363,7 @@ app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.56-transportes', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.57-permisos-pestanas', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

@@ -2654,7 +2654,7 @@ app.post('/api/despacho/despachar', async (req, res) => {
       col = colectas.find(c => c.tanda === tipo) || null;
     } catch (e) { /* sin colecta, registramos igual */ }
 
-    const { error } = await supabase.from('dep_despachos').insert({
+    let filaDesp = {
       verificacion: req._verifTipo || null,
       shipment_id: s.shipment_id, nro_venta: s.nro_venta || null,
       sku: s.sku || null, titulo: s.titulo || null, tipo: tipo || null,
@@ -2665,7 +2665,14 @@ app.post('/api/despacho/despachar', async (req, res) => {
       destino_id: destino ? destino.id : null,
       destino_nombre: destino ? destino.nombre : null,
       transportista: destino ? (destino.transportista || null) : null
-    });
+    };
+    let { error } = await supabase.from('dep_despachos').insert(filaDesp);
+    if (error && /verificacion/i.test(error.message || '')) {
+      // La columna de auditoría no existe todavía → registramos igual sin ella
+      console.warn('[DESPACHO] columna verificacion ausente — registrando sin auditoría. Corré: alter table dep_despachos add column if not exists verificacion text;');
+      delete filaDesp.verificacion;
+      ({ error } = await supabase.from('dep_despachos').insert(filaDesp));
+    }
     if (error) throw new Error(error.message);
 
     // Criterio (opción 3): bloquear solo si CANCELADA (ya filtrado arriba).
@@ -3615,7 +3622,7 @@ app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.61-ean-unico-aprobacion', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.62-insert-blindado', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

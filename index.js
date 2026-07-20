@@ -1457,6 +1457,16 @@ async function verifProductosOn() {
   return _verifCfg.on;
 }
 
+let _aprobCfg = { codigo: null, t: 0 };
+async function codigoAprobacion() {
+  if (Date.now() - _aprobCfg.t < 60000) return _aprobCfg.codigo;
+  try {
+    const { data } = await supabase.from('dep_ajustes').select('valor').eq('clave', 'verif_codigo_aprob').limit(1);
+    _aprobCfg = { codigo: (data && data[0] && data[0].valor) || null, t: Date.now() };
+  } catch (e) { _aprobCfg.t = Date.now(); }
+  return _aprobCfg.codigo;
+}
+
 async function catalogoProductos() {
   if (_prodCache.map && Date.now() - _prodCache.t < 60000) return _prodCache.map;
   const m = new Map(); const porEan = new Map(); let from = 0; const size = 1000;
@@ -1481,7 +1491,10 @@ app.get('/api/despacho/verificacion', async (_req, res) => {
     _verifCfg.t = 0; const on = await verifProductosOn();
     _prodCache.t = 0; const m = await catalogoProductos();
     let req_ = 0; for (const p of m.values()) if (p.requiere) req_++;
-    res.json({ on, total: m.size, requieren: req_ });
+    _aprobCfg.t = 0; const cod = await codigoAprobacion();
+    const esConfig = (_req.pestLog || []).includes('config');
+    res.json({ on, total: m.size, requieren: req_, tiene_codigo_aprob: !!cod,
+      codigo_aprob: esConfig ? (cod || '') : undefined });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1495,6 +1508,20 @@ app.post('/api/despacho/verificacion', async (req, res) => {
     _verifCfg = { on, t: Date.now() };
     console.log(`[VERIF] verificación de productos: ${on ? 'ACTIVADA' : 'desactivada'} por ${(req.authUser && req.authUser.email) || '?'}`);
     res.json({ ok: true, on });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Definir el código de barras de aprobación del encargado
+app.post('/api/despacho/verificacion-codigo', async (req, res) => {
+  try {
+    if (!(req.pestLog || []).includes('config')) return res.status(403).json({ error: 'Solo configurable por quien ve Ajustes' });
+    const codigo = String((req.body && req.body.codigo) || '').trim();
+    const { error } = await supabase.from('dep_ajustes')
+      .upsert({ clave: 'verif_codigo_aprob', valor: codigo || null }, { onConflict: 'clave' });
+    if (error) throw new Error(error.message);
+    _aprobCfg = { codigo: codigo || null, t: Date.now() };
+    console.log(`[VERIF] código de aprobación ${codigo ? 'actualizado' : 'borrado'} por ${(req.authUser && req.authUser.email) || '?'}`);
+    res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1514,20 +1541,39 @@ app.get('/api/despacho/productos', async (req, res) => {
 app.post('/api/despacho/productos/importar', async (req, res) => {
   try {
     const texto = String((req.body && req.body.texto) || '');
-    const filas = []; let invalidas = 0;
+    const porSku = new Map(); let invalidas = 0; // dedupe: si un SKU se repite, vale la última fila
     for (const lineaRaw of texto.split(/\r?\n/)) {
       const linea = lineaRaw.trim(); if (!linea) continue;
       const partes = linea.split(/[	;,]+|\s{2,}/).map(x => x.trim()).filter(Boolean);
       if (partes.length === 1) { // solo SKU, sin EAN aún
-        filas.push({ sku: partes[0].toUpperCase(), ean: null, requiere: true }); continue;
+        porSku.set(partes[0].toUpperCase(), { sku: partes[0].toUpperCase(), ean: null, requiere: true, actualizado_at: new Date().toISOString() });
+        continue;
       }
       const sku = partes[0].toUpperCase();
       const ean = (partes[1] || '').replace(/\D/g, '') || null;
       const tercero = (partes[2] || '').toLowerCase();
       const requiere = !(tercero === 'no' || tercero === '0' || tercero === 'false');
       if (!sku) { invalidas++; continue; }
-      filas.push({ sku, ean, requiere, actualizado_at: new Date().toISOString() });
+      porSku.set(sku, { sku, ean, requiere, actualizado_at: new Date().toISOString() });
     }
+    // EAN único: un mismo EAN no puede pertenecer a dos SKUs (ni en el lote ni contra lo ya guardado)
+    _prodCache.t = 0; await catalogoProductos();
+    const duenoDe = new Map(); // ean → sku
+    for (const [e, p] of (_prodCache.porEan || new Map())) duenoDe.set(e, p.sku);
+    const conflictos = new Map(); // ean → set de skus en conflicto
+    for (const f of porSku.values()) {
+      if (!f.ean) continue;
+      const dueno = duenoDe.get(f.ean);
+      if (dueno && dueno !== f.sku) {
+        if (!conflictos.has(f.ean)) conflictos.set(f.ean, new Set([dueno]));
+        conflictos.get(f.ean).add(f.sku);
+      } else duenoDe.set(f.ean, f.sku);
+    }
+    for (const [e, skus] of conflictos) for (const s2 of skus) porSku.delete(s2); // afuera todos los del conflicto
+    const filas = [...porSku.values()];
+    const conflictos_ean = [...conflictos.entries()].map(([ean, skus]) => ({ ean, skus: [...skus] }));
+    if (!filas.length && conflictos_ean.length)
+      return res.status(400).json({ error: 'Todas las líneas tienen EANs en conflicto', conflictos_ean });
     if (!filas.length) return res.status(400).json({ error: 'No encontré líneas válidas (formato: SKU  EAN por línea)' });
     // upsert de a 500
     for (let i = 0; i < filas.length; i += 500) {
@@ -1535,8 +1581,8 @@ app.post('/api/despacho/productos/importar', async (req, res) => {
       if (error) throw new Error(error.message);
     }
     _prodCache.t = 0;
-    console.log(`[VERIF] importados ${filas.length} producto(s)`);
-    res.json({ ok: true, importados: filas.length, invalidas });
+    console.log(`[VERIF] importados ${filas.length} producto(s)${conflictos_ean.length ? ` · ${conflictos_ean.length} EAN(s) en conflicto excluidos` : ''}`);
+    res.json({ ok: true, importados: filas.length, invalidas, conflictos_ean });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1547,6 +1593,12 @@ app.post('/api/despacho/productos/uno', async (req, res) => {
     if (!sku) return res.status(400).json({ error: 'Falta el SKU' });
     const ean = String((req.body && req.body.ean) || '').replace(/\D/g, '') || null;
     const requiere = (req.body && 'requiere' in req.body) ? !!req.body.requiere : true;
+    if (ean) {
+      _prodCache.t = 0; await catalogoProductos();
+      const dueno = (_prodCache.porEan || new Map()).get(ean);
+      if (dueno && dueno.sku !== sku)
+        return res.status(400).json({ error: `Ese EAN ya está asignado a ${dueno.sku} — un EAN no puede estar en dos SKUs` });
+    }
     const { error } = await supabase.from('dep_productos')
       .upsert({ sku, ean, requiere, actualizado_at: new Date().toISOString() }, { onConflict: 'sku' });
     if (error) throw new Error(error.message);
@@ -2558,23 +2610,38 @@ app.post('/api/despacho/despachar', async (req, res) => {
           const cat = await catalogoProductos();
           const p = s.sku ? cat.get(String(s.sku).trim().toUpperCase()) : null;
           if (p && p.requiere) {
-            // ¿Vino un producto en mano (escaneado antes que la etiqueta)?
-            const manoEan = String((req.body && req.body.producto_ean) || '').replace(/[^0-9]/g, '');
-            const manoSku = String((req.body && req.body.producto_sku) || '').trim().toUpperCase();
-            const coincide = (manoEan && p.ean && manoEan === String(p.ean).replace(/[^0-9]/g, ''))
-                          || (manoSku && manoSku === p.sku);
-            if (!coincide) {
-              if (manoEan || manoSku) {
-                return res.json({ resultado: 'producto_distinto',
-                  mensaje: 'El producto en mano NO corresponde a esta etiqueta',
-                  esperado_sku: p.sku, esperado_ean: p.ean || null,
-                  en_mano_sku: manoSku || null, ...base });
+            // 1) Segundo escaneo tras la etiqueta (verif_codigo): EAN, SKU o código de aprobación
+            const escaneo = String((req.body && req.body.verif_codigo) || '').trim();
+            if (escaneo) {
+              const digE = escaneo.replace(/[^0-9]/g, '');
+              const okEan = p.ean && digE && digE === String(p.ean).replace(/[^0-9]/g, '');
+              const okSku = escaneo.toUpperCase() === p.sku;
+              const codA = await codigoAprobacion();
+              const okAprob = codA && escaneo === codA;
+              if (okEan || okSku) req._verifTipo = 'ean';
+              else if (okAprob) req._verifTipo = 'aprobado';
+              else return res.json({ resultado: 'producto_equivocado',
+                mensaje: 'Ese código no es el producto esperado ni el de aprobación',
+                esperado_sku: p.sku, esperado_ean: p.ean || null, ...base });
+            } else {
+              // 2) ¿Vino un producto en mano (escaneado antes que la etiqueta)?
+              const manoEan = String((req.body && req.body.producto_ean) || '').replace(/[^0-9]/g, '');
+              const manoSku = String((req.body && req.body.producto_sku) || '').trim().toUpperCase();
+              const coincide = (manoEan && p.ean && manoEan === String(p.ean).replace(/[^0-9]/g, ''))
+                            || (manoSku && manoSku === p.sku);
+              if (!coincide) {
+                if (manoEan || manoSku) {
+                  return res.json({ resultado: 'producto_distinto',
+                    mensaje: 'El producto en mano NO corresponde a esta etiqueta',
+                    esperado_sku: p.sku, esperado_ean: p.ean || null,
+                    en_mano_sku: manoSku || null, ...base });
+                }
+                return res.json({ resultado: 'verificar',
+                  mensaje: 'Verificá el producto: escaneá su EAN (o el código de aprobación del encargado)',
+                  ean: p.ean || null, ...base });
               }
-              return res.json({ resultado: 'verificar',
-                mensaje: 'Verificá el producto: escaneá su código de barras (EAN)',
-                ean: p.ean || null, ...base });
+              req._verifTipo = 'ean'; // producto en mano correcto
             }
-            // producto en mano correcto → sigue y registra
           }
         }
       } catch (e) { /* si falla la config, no frenamos el despacho */ }
@@ -2588,6 +2655,7 @@ app.post('/api/despacho/despachar', async (req, res) => {
     } catch (e) { /* sin colecta, registramos igual */ }
 
     const { error } = await supabase.from('dep_despachos').insert({
+      verificacion: req._verifTipo || null,
       shipment_id: s.shipment_id, nro_venta: s.nro_venta || null,
       sku: s.sku || null, titulo: s.titulo || null, tipo: tipo || null,
       usuario: (req.authUser && req.authUser.email) || null,
@@ -3547,7 +3615,7 @@ app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.59-verif-cualquier-orden', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.61-ean-unico-aprobacion', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

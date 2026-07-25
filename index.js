@@ -54,6 +54,16 @@ setTimeout(cargarDepositosCfg, 3000);
 setInterval(cargarDepositosCfg, 10 * 60 * 1000);
 
 // ¿Este envío sale de nuestro depósito? (por ID si hay principal; si no, por texto)
+// Cuando ML no manda sender_address.id, algunas direcciones (ej. depósitos socios
+// de Flex) traen su identificador en types: "logistic_center_XXXX" → lo usamos como ID.
+function idDeDeposito(sa) {
+  if (sa && sa.id) return String(sa.id);
+  const lc = (sa && Array.isArray(sa.types))
+    ? sa.types.find(t => typeof t === 'string' && t.startsWith('logistic_center_'))
+    : null;
+  return lc ? lc.replace('logistic_center_', '') : '';
+}
+
 function esDeNuestroDeposito(depId, depDir) {
   if (_depCfg.principalId) {
     if (depId) return String(depId) === _depCfg.principalId;
@@ -416,7 +426,7 @@ async function obtenerShipmentsDetallados(token, onLote) {
                     && ship.shipping_option.estimated_delivery_time.pay_before) || null;
       s.date_handling = (ship.status_history && ship.status_history.date_handling) || null;
       const sa = ship.sender_address || {};
-      s.dep_id  = sa.id ? String(sa.id) : '';
+      s.dep_id  = idDeDeposito(sa);
       s.dep_dir = `${sa.address_line || ''} ${(sa.city && sa.city.name) || ''}`.trim();
     } catch (e) { s.status = 'error'; s.logistic = ''; s.limite = null; s.pay_before = null; s.dep_id = ''; s.dep_dir = ''; }
     return s;
@@ -529,7 +539,7 @@ async function actualizarFotoEnvio(shipmentId, token) {
       date_handling: (ship.status_history && ship.status_history.date_handling) || null,
     };
     const sa = ship.sender_address || {};
-    s.dep_id = sa.id ? String(sa.id) : '';
+    s.dep_id = idDeDeposito(sa);
     s.dep_dir = `${sa.address_line || ''} ${(sa.city && sa.city.name) || ''}`.trim();
 
     // Datos de la orden (SKU, título, venta) — los traemos si el envío los referencia
@@ -618,9 +628,8 @@ async function obtenerEnvios(tipo, deposito) {
   const deLaTanda = detallados
     .filter(s => s.logistic === logisticBuscado)
     .filter(s => depBuscado
-      ? (/^\d+$/.test(depBuscado)
-          ? String(s.dep_id || '') === depBuscado           // depósito puntual por ID (exacto)
-          : normalizar(s.dep_dir || '') === depBuscado)     // compatibilidad: por dirección
+      ? (String(s.dep_id || '') === (deposito || '').trim() // depósito puntual por ID exacto (numérico o ARP…)
+         || normalizar(s.dep_dir || '') === depBuscado)     // compatibilidad: por dirección
       : s.es_nuestro !== false);                            // por defecto: solo el nuestro
 
   // Criterio (copiando a ML): "listo para imprimir" = substatus
@@ -1469,6 +1478,7 @@ app.get('/api/despacho/depositos-ml', async (req, res) => {
         const detallados = await obtenerDetalladosConCache(token);
         const m = new Map();
         for (const s of detallados) {
+          if (s.logistic === 'fulfillment') continue; // los centros de FULL son de ML, no se vinculan
           if (s.dep_id && !m.has(String(s.dep_id))) m.set(String(s.dep_id), s.dep_dir || null);
         }
         filas = [...m.entries()].map(([id, dir]) => ({
@@ -3697,7 +3707,7 @@ app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.67-full-es-de-ml', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.68-flex-baires-ruteado', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

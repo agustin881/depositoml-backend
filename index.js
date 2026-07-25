@@ -55,7 +55,20 @@ setInterval(cargarDepositosCfg, 10 * 60 * 1000);
 
 // ¿Este envío sale de nuestro depósito? (por ID si hay principal; si no, por texto)
 function esDeNuestroDeposito(depId, depDir) {
-  if (_depCfg.principalId) return !depId ? true : String(depId) === _depCfg.principalId;
+  if (_depCfg.principalId) {
+    if (depId) return String(depId) === _depCfg.principalId;
+    // ML no mandó el ID (pasa con algunas direcciones) → comparamos por dirección
+    if (depDir) {
+      const nd = normalizar(depDir);
+      const ppal = _depCfg.porId.get(_depCfg.principalId);
+      if (ppal && ppal.direccion && normalizar(ppal.direccion) === nd) return true;   // es la dirección del principal
+      for (const d of _depCfg.porId.values())
+        if (String(d.ml_address_id) !== _depCfg.principalId && d.direccion && normalizar(d.direccion) === nd) return false; // es la de OTRO depósito
+      if (DEPOSITO_FILTRO) return nd.includes(DEPOSITO_FILTRO);  // desconocida → respaldo por texto
+      return true;
+    }
+    return true; // sin ID ni dirección: no perdemos el envío
+  }
   if (!DEPOSITO_FILTRO) return true;
   return !depDir ? true : normalizar(depDir).includes(DEPOSITO_FILTRO) || String(depId || '') === DEPOSITO_FILTRO;
 }
@@ -414,9 +427,12 @@ async function obtenerShipmentsDetallados(token, onLote) {
   // Estadísticas por depósito de origen (para verificar qué entra y qué queda afuera)
   const statsDep = new Map();
   const anotarDep = (s, incluido) => {
-    const k = s.dep_id ? String(s.dep_id) : (s.dep_dir || '(sin dirección)');
+    const esFull = s.logistic === 'fulfillment';
+    const k = esFull ? 'full' : (s.dep_id ? String(s.dep_id) : ('dir:' + (s.dep_dir || '(sin dirección)')));
     let e = statsDep.get(k);
-    if (!e) { e = { id: s.dep_id ? String(s.dep_id) : null, deposito: nombreDeposito(s.dep_id, s.dep_dir), incluidos: 0, excluidos: 0 }; statsDep.set(k, e); }
+    if (!e) { e = { id: esFull ? null : (s.dep_id ? String(s.dep_id) : null),
+      deposito: esFull ? '⚡ FULL — lo despacha Mercado Libre' : nombreDeposito(s.dep_id, s.dep_dir),
+      incluidos: 0, excluidos: 0 }; statsDep.set(k, e); }
     if (incluido) e.incluidos++; else e.excluidos++;
   };
 
@@ -431,9 +447,18 @@ async function obtenerShipmentsDetallados(token, onLote) {
     // Marcamos cuáles son de nuestro depósito; guardamos TODOS en memoria
     // (para poder consultar otros depósitos) pero la foto local (onLote)
     // sigue recibiendo SOLO los nuestros, igual que siempre.
-    const conMarca = detallados.map(s => { s.es_nuestro = pasaFiltro(s); anotarDep(s, s.es_nuestro); if (!s.es_nuestro) afuera++; return s; });
+    const conMarca = detallados.map(s => {
+      s.es_nuestro = (s.logistic === 'fulfillment') ? false : pasaFiltro(s); // FULL: lo despacha ML
+      anotarDep(s, s.es_nuestro); if (!s.es_nuestro) afuera++; return s;
+    });
     const delDeposito = conMarca.filter(s => s.es_nuestro);
     if (onLote && delDeposito.length) { try { await onLote(delDeposito); } catch (e) { console.error('[ENVIOS] onLote', e.message); } }
+    // Auto-curación: si la foto local tiene envíos ajenos marcados como nuestros, corregirlos
+    const ajenos = conMarca.filter(s => !s.es_nuestro).map(s => s.shipment_id);
+    if (ajenos.length) {
+      try { await supabase.from('dep_envios').update({ es_nuestro: false }).in('shipment_id', ajenos).eq('es_nuestro', true); }
+      catch (e) { /* columna o filas ausentes: sin drama */ }
+    }
     for (const s of conMarca) todos.push(s);
     procesados += bloque.length;
     console.log(`[ENVIOS] progreso ${procesados}/${shipments.length} (nuestro: ${todos.filter(x=>x.es_nuestro).length} · otros: ${afuera})`);
@@ -460,7 +485,8 @@ const tipoDeLogistic = lt =>
 function filaEnvio(s) {
   const lt = s.logistic || '';
   const dir = s.dep_dir || '';
-  const esNuestro = esDeNuestroDeposito(s.dep_id, dir);
+  // FULL lo despacha Mercado Libre desde su propio depósito: nunca entra a nuestra operación
+  const esNuestro = lt === 'fulfillment' ? false : esDeNuestroDeposito(s.dep_id, dir);
   return {
     shipment_id: String(s.shipment_id),
     nro_venta: s.nro_venta ? String(s.nro_venta) : null,
@@ -1363,15 +1389,37 @@ app.get('/api/despacho/diag-depcfg', async (req, res) => {
     await cargarDepositosCfg();
     const token = await getValidToken(ML_USER_ID);
     const detallados = token ? await obtenerDetalladosConCache(token) : [];
+    // ¿Piden la radiografía de una venta puntual?
+    const venta = (req.query.venta || '').trim();
+    let ventaInfo = null;
+    if (venta && token) {
+      try {
+        const ro = await fetch(`https://api.mercadolibre.com/orders/${venta}?access_token=${token}`);
+        const order = await ro.json();
+        const shipId = order.shipping && order.shipping.id;
+        if (shipId) {
+          const rs = await fetch(`https://api.mercadolibre.com/shipments/${shipId}`, { headers: { Authorization: `Bearer ${token}` } });
+          const sh = await rs.json();
+          const sa = sh.sender_address || {};
+          ventaInfo = { venta, shipment_id: String(shipId), logistic_type: sh.logistic_type || null,
+            status: sh.status, substatus: sh.substatus || null,
+            sender_address: { id: sa.id !== undefined ? sa.id : null, address_line: sa.address_line || null,
+              city: (sa.city && sa.city.name) || null, comment: sa.comment || null, types: sa.types || null },
+            seria_nuestro: esDeNuestroDeposito(sa.id ? String(sa.id) : '', `${sa.address_line || ''} ${(sa.city && sa.city.name) || ''}`.trim()) };
+        } else ventaInfo = { venta, error: 'sin envío asociado' };
+      } catch (e) { ventaInfo = { venta, error: e.message }; }
+    }
     const porDep = new Map();
     for (const s of detallados) {
-      const k = s.dep_id ? String(s.dep_id) : '(vacío)';
+      const k = s.dep_id ? String(s.dep_id) : ('dir: ' + (s.dep_dir || '(sin dirección)'));
       let e = porDep.get(k);
-      if (!e) { e = { dep_id: k, dep_dir: s.dep_dir || '', total: 0, es_nuestro_true: 0, es_nuestro_false: 0, muestra: s.shipment_id }; porDep.set(k, e); }
+      if (!e) { e = { dep_id: s.dep_id ? String(s.dep_id) : null, dep_dir: s.dep_dir || '', total: 0, es_nuestro_true: 0, es_nuestro_false: 0, logisticas: {}, muestra: s.shipment_id }; porDep.set(k, e); }
       e.total++;
+      e.logisticas[s.logistic || '?'] = (e.logisticas[s.logistic || '?'] || 0) + 1;
       if (s.es_nuestro === false) e.es_nuestro_false++; else e.es_nuestro_true++;
     }
     res.json({
+      venta_consultada: ventaInfo,
       principal_configurado: _depCfg.principalId || null,
       filtro_texto: DEPOSITO_FILTRO || null,
       depositos_vinculados: [..._depCfg.porId.values()].map(d => ({ id: d.ml_address_id, alias: d.alias, principal: !!d.es_principal, direccion: d.direccion })),
@@ -3649,7 +3697,7 @@ app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.64-diag-pase', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.67-full-es-de-ml', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

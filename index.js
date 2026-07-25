@@ -1482,10 +1482,17 @@ app.get('/api/despacho/depositos-ml', async (req, res) => {
         const m = new Map();
         for (const s of detallados) {
           if (s.logistic === 'fulfillment') continue; // los centros de FULL son de ML, no se vinculan
-          if (s.dep_id && !m.has(String(s.dep_id))) m.set(String(s.dep_id), s.dep_dir || null);
+          if (!s.dep_id) continue;
+          const k = String(s.dep_id);
+          let e = m.get(k);
+          if (!e) { e = { dir: s.dep_dir || null, logs: new Set() }; m.set(k, e); }
+          if (s.logistic === 'cross_docking') e.logs.add('colecta');
+          else if (s.logistic === 'self_service') e.logs.add('flex');
         }
-        filas = [...m.entries()].map(([id, dir]) => ({
-          ml_address_id: id, direccion: dir, ciudad: null, actualizado_at: new Date().toISOString()
+        filas = [...m.entries()].map(([id, e]) => ({
+          ml_address_id: id, direccion: e.dir, ciudad: null,
+          logistica: [...e.logs].sort().join('+') || null,
+          actualizado_at: new Date().toISOString()
         }));
         if (!filas.length) throw new Error('ML bloqueó la consulta de direcciones y todavía no hay envíos en el caché para cosechar. Tocá "Actualizar ahora" en Imprimir, esperá que termine, y probá de nuevo.');
       }
@@ -1496,7 +1503,7 @@ app.get('/api/despacho/depositos-ml', async (req, res) => {
       req._origenPesca = origen;
     }
     const { data, error } = await supabase.from('dep_depositos')
-      .select('ml_address_id,direccion,ciudad,alias,es_principal').order('es_principal', { ascending: false });
+      .select('ml_address_id,direccion,ciudad,alias,es_principal,logistica').order('es_principal', { ascending: false });
     if (error) throw new Error(error.message);
     res.json({ depositos: data || [], origen: req._origenPesca || null, filtro_texto_activo: !(_depCfg.principalIds && _depCfg.principalIds.size) ? (DEPOSITO_FILTRO || null) : null });
   } catch (e) { console.error('[DEPOSITOS-ML]', e.message); res.status(500).json({ error: e.message }); }
@@ -3710,7 +3717,7 @@ app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.69-multi-principal', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.70-depositos-agrupados', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

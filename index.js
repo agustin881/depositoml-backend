@@ -36,18 +36,19 @@ const CLAVE_DIAG       = (process.env.CLAVE_DIAG || '').trim(); // clave de los 
 // Si hay un depósito marcado como principal, el filtro usa el ID EXACTO
 // (robusto: distingue dos depósitos en la misma ciudad). Si no hay ninguno
 // configurado, se usa el filtro por texto DEPOSITO_FILTRO como siempre.
-let _depCfg = { porId: new Map(), principalId: null };
+let _depCfg = { porId: new Map(), principalId: null, principalIds: new Set() };
 async function cargarDepositosCfg() {
   try {
     const { data, error } = await supabase.from('dep_depositos').select('ml_address_id,alias,direccion,es_principal');
     if (error) { console.error('[DEPCFG]', error.message); return; }
-    const m = new Map(); let ppal = null;
+    const m = new Map(); const ppales = new Set();
     for (const d of (data || [])) {
       m.set(String(d.ml_address_id), d);
-      if (d.es_principal) ppal = String(d.ml_address_id);
+      if (d.es_principal) ppales.add(String(d.ml_address_id));
     }
-    _depCfg = { porId: m, principalId: ppal };
-    console.log(`[DEPCFG] ${m.size} depósito(s) vinculados · principal: ${ppal ? (m.get(ppal).alias || ppal) : '(ninguno → filtro por texto "' + (DEPOSITO_FILTRO || 'desactivado') + '")'}`);
+    _depCfg = { porId: m, principalId: [...ppales][0] || null, principalIds: ppales };
+    const nombres = [...ppales].map(id => (m.get(id) && m.get(id).alias) || id).join(' + ');
+    console.log(`[DEPCFG] ${m.size} depósito(s) vinculados · principal(es): ${nombres || '(ninguno → filtro por texto "' + (DEPOSITO_FILTRO || 'desactivado') + '")'}`);
   } catch (e) { console.error('[DEPCFG]', e.message); }
 }
 setTimeout(cargarDepositosCfg, 3000);
@@ -65,15 +66,17 @@ function idDeDeposito(sa) {
 }
 
 function esDeNuestroDeposito(depId, depDir) {
-  if (_depCfg.principalId) {
-    if (depId) return String(depId) === _depCfg.principalId;
-    // ML no mandó el ID (pasa con algunas direcciones) → comparamos por dirección
+  if (_depCfg.principalIds && _depCfg.principalIds.size) {
+    if (depId) return _depCfg.principalIds.has(String(depId));
+    // ML no mandó ningún ID → comparamos por dirección
     if (depDir) {
       const nd = normalizar(depDir);
-      const ppal = _depCfg.porId.get(_depCfg.principalId);
-      if (ppal && ppal.direccion && normalizar(ppal.direccion) === nd) return true;   // es la dirección del principal
+      for (const id of _depCfg.principalIds) {
+        const p = _depCfg.porId.get(id);
+        if (p && p.direccion && normalizar(p.direccion) === nd) return true;         // dirección de un principal
+      }
       for (const d of _depCfg.porId.values())
-        if (String(d.ml_address_id) !== _depCfg.principalId && d.direccion && normalizar(d.direccion) === nd) return false; // es la de OTRO depósito
+        if (!_depCfg.principalIds.has(String(d.ml_address_id)) && d.direccion && normalizar(d.direccion) === nd) return false; // dirección de OTRO depósito
       if (DEPOSITO_FILTRO) return nd.includes(DEPOSITO_FILTRO);  // desconocida → respaldo por texto
       return true;
     }
@@ -475,11 +478,11 @@ async function obtenerShipmentsDetallados(token, onLote) {
     await sleep(120);
   }
   if (afuera) console.log(`[ENVIOS] ${afuera} envío(s) de otro depósito quedaron afuera`);
-  const modoFiltro = _depCfg.principalId
-    ? `${nombreDeposito(_depCfg.principalId, null)} — por ID exacto`
+  const modoFiltro = (_depCfg.principalIds && _depCfg.principalIds.size)
+    ? `${[..._depCfg.principalIds].map(id => nombreDeposito(id, null)).join(' + ')} — por ID exacto`
     : (DEPOSITO_FILTRO ? `texto "${DEPOSITO_FILTRO}"` : '(desactivado: entra todo)');
   _depositosStats = { filtro: modoFiltro, modo: _depCfg.principalId ? 'principal' : 'texto',
-    depositos: [...statsDep.values()].map(e => ({ ...e, es_principal: !!(_depCfg.principalId && e.id === _depCfg.principalId) }))
+    depositos: [...statsDep.values()].map(e => ({ ...e, es_principal: !!(e.id && _depCfg.principalIds && _depCfg.principalIds.has(e.id)) }))
       .sort((a,b)=>b.incluidos-a.incluidos || b.excluidos-a.excluidos),
     actualizado: new Date().toISOString() };
   return todos;
@@ -1429,7 +1432,7 @@ app.get('/api/despacho/diag-depcfg', async (req, res) => {
     }
     res.json({
       venta_consultada: ventaInfo,
-      principal_configurado: _depCfg.principalId || null,
+      principal_configurado: [...(_depCfg.principalIds || [])].join(' + ') || null,
       filtro_texto: DEPOSITO_FILTRO || null,
       depositos_vinculados: [..._depCfg.porId.values()].map(d => ({ id: d.ml_address_id, alias: d.alias, principal: !!d.es_principal, direccion: d.direccion })),
       envios_en_cache: detallados.length,
@@ -1495,7 +1498,7 @@ app.get('/api/despacho/depositos-ml', async (req, res) => {
     const { data, error } = await supabase.from('dep_depositos')
       .select('ml_address_id,direccion,ciudad,alias,es_principal').order('es_principal', { ascending: false });
     if (error) throw new Error(error.message);
-    res.json({ depositos: data || [], origen: req._origenPesca || null, filtro_texto_activo: !_depCfg.principalId ? (DEPOSITO_FILTRO || null) : null });
+    res.json({ depositos: data || [], origen: req._origenPesca || null, filtro_texto_activo: !(_depCfg.principalIds && _depCfg.principalIds.size) ? (DEPOSITO_FILTRO || null) : null });
   } catch (e) { console.error('[DEPOSITOS-ML]', e.message); res.status(500).json({ error: e.message }); }
 });
 
@@ -1515,13 +1518,13 @@ app.post('/api/despacho/depositos-ml/principal', async (req, res) => {
   try {
     const id = String((req.body && req.body.ml_address_id) || '').trim();
     if (!id) return res.status(400).json({ error: 'Falta el ID del depósito' });
-    const { error: e1 } = await supabase.from('dep_depositos').update({ es_principal: false }).neq('ml_address_id', '~');
-    if (e1) throw new Error(e1.message);
-    const { error: e2 } = await supabase.from('dep_depositos').update({ es_principal: true }).eq('ml_address_id', id);
-    if (e2) throw new Error(e2.message);
+    // principal: true/false por fila → un depósito físico puede tener varias identidades de ML
+    const valor = (req.body && 'principal' in req.body) ? !!req.body.principal : true;
+    const { error } = await supabase.from('dep_depositos').update({ es_principal: valor }).eq('ml_address_id', id);
+    if (error) throw new Error(error.message);
     await cargarDepositosCfg();
     invalidarCacheEnvios();
-    res.json({ ok: true, principal: id });
+    res.json({ ok: true, principales: [..._depCfg.principalIds] });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -3707,7 +3710,7 @@ app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.68-flex-baires-ruteado', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.69-multi-principal', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

@@ -168,7 +168,7 @@ function pestLogPorRol(rol) {
 async function requireAuth(req, res, next) {
   try {
     // Excepción temporal: diagnóstico accesible con clave en la URL (para debug)
-    if ((req.path === '/diag' || req.path === '/diag-envio' || req.path === '/diag-colectas' || req.path === '/diag-fechas' || req.path === '/diag-nodo' || req.path === '/diag-imprimir' || req.path === '/diag-camion' || req.path === '/diag-fechadesp' || req.path === '/diag-skus' || req.path === '/diag-cancel' || req.path === '/diag-colcancel' || req.path === '/diag-key') && CLAVE_DIAG && (req.query.clave || '') === CLAVE_DIAG) return next();
+    if (req.path.startsWith('/diag') && CLAVE_DIAG && (req.query.clave || '') === CLAVE_DIAG) return next();
     const h = req.headers.authorization || '';
     const token = h.startsWith('Bearer ') ? h.slice(7) : '';
     if (!token) return res.status(401).json({ error: 'No autorizado' });
@@ -3649,7 +3649,7 @@ app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.63-diag-ruteo', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.64-diag-pase', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

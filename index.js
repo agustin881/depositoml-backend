@@ -39,7 +39,7 @@ const CLAVE_DIAG       = (process.env.CLAVE_DIAG || '').trim(); // clave de los 
 let _depCfg = { porId: new Map(), principalId: null, principalIds: new Set() };
 async function cargarDepositosCfg() {
   try {
-    const { data, error } = await supabase.from('dep_depositos').select('ml_address_id,alias,direccion,es_principal');
+    const { data, error } = await supabase.from('dep_depositos').select('ml_address_id,alias,direccion,es_principal,verifica');
     if (error) { console.error('[DEPCFG]', error.message); return; }
     const m = new Map(); const ppales = new Set();
     for (const d of (data || [])) {
@@ -1020,8 +1020,9 @@ function horaDeART(iso) {
   } catch (_) { return null; }
 }
 
-app.get('/api/despacho/panel', async (_req, res) => {
+app.get('/api/despacho/panel', async (req, res) => {
   try {
+    const depParam = (req.query.deposito || '').trim();
     // Estados despachados localmente (escaneados al cargar el camión)
     const { data: desp } = await supabase.from('dep_despachos')
       .select('shipment_id,despachado_at,colecta_carrier,colecta_patente');
@@ -1032,8 +1033,23 @@ app.get('/api/despacho/panel', async (_req, res) => {
     const { data: imp } = await supabase.from('dep_impresiones').select('shipment_id');
     const impSet = new Set((imp || []).map(r => r.shipment_id));
 
+    let envios = [];
+    if (depParam) {
+      // Seguimiento de OTRO depósito (ej. FLEX BAIRES): directo del caché de ML
+      const tokenDep = await getValidToken(ML_USER_ID);
+      const det = tokenDep ? await obtenerDetalladosConCache(tokenDep) : [];
+      const depNorm = normalizar(depParam);
+      envios = det
+        .filter(x => x.logistic !== 'fulfillment')
+        .filter(x => String(x.dep_id || '') === depParam || normalizar(x.dep_dir || '') === depNorm)
+        .map(x => ({ shipment_id: x.shipment_id, nro_venta: x.nro_venta, sku: x.sku, titulo: x.titulo,
+          unidades: x.unidades || 1, tipo: tipoDeLogistic(x.logistic),
+          status: x.status, substatus: x.substatus, limite: x.limite, pay_before: x.pay_before,
+          date_handling: x.date_handling, es_nuestro: x.es_nuestro,
+          cancelada: x.cancelada || x.status === 'cancelled', actualizado_at: null }));
+    } else {
     // Foto local (solo lo nuestro, sin Full)
-    let envios = [], from = 0;
+    let from = 0;
     while (true) {
       const { data, error } = await supabase.from('dep_envios')
         .select('shipment_id,nro_venta,sku,titulo,unidades,tipo,status,substatus,limite,pay_before,date_handling,es_nuestro,cancelada,actualizado_at')
@@ -1044,6 +1060,7 @@ app.get('/api/despacho/panel', async (_req, res) => {
       envios = envios.concat(data);
       if (data.length < 1000) break;
       from += 1000;
+    }
     }
 
     const hoy = fechaHoyART();
@@ -1503,7 +1520,7 @@ app.get('/api/despacho/depositos-ml', async (req, res) => {
       req._origenPesca = origen;
     }
     const { data, error } = await supabase.from('dep_depositos')
-      .select('ml_address_id,direccion,ciudad,alias,es_principal,logistica').order('es_principal', { ascending: false });
+      .select('ml_address_id,direccion,ciudad,alias,es_principal,logistica,verifica').order('es_principal', { ascending: false });
     if (error) throw new Error(error.message);
     res.json({ depositos: data || [], origen: req._origenPesca || null, filtro_texto_activo: !(_depCfg.principalIds && _depCfg.principalIds.size) ? (DEPOSITO_FILTRO || null) : null });
   } catch (e) { console.error('[DEPOSITOS-ML]', e.message); res.status(500).json({ error: e.message }); }
@@ -2701,7 +2718,13 @@ app.post('/api/despacho/despachar', async (req, res) => {
     //    NO registramos todavía: pedimos escanear el EAN del producto.
     if (!(req.body && req.body.verificado)) {
       try {
-        if (await verifProductosOn()) {
+        // ¿Este depósito verifica productos? Manda el tilde de Configuración.
+        // Sin tilde conocido, aplica solo a lo que sale de NUESTRO depósito.
+        const rowDep = s.dep_id ? _depCfg.porId.get(String(s.dep_id)) : null;
+        const verificaDep = rowDep
+          ? rowDep.verifica !== false
+          : ((typeof s.es_nuestro === 'boolean') ? s.es_nuestro : esDeNuestroDeposito(s.dep_id || '', s.dep_dir || ''));
+        if (verificaDep && await verifProductosOn()) {
           const cat = await catalogoProductos();
           const p = s.sku ? cat.get(String(s.sku).trim().toUpperCase()) : null;
           if (p && p.requiere) {
@@ -3696,6 +3719,19 @@ app.post('/api/despacho/transportes/cerrar', async (req, res) => {
   } catch (e) { console.error('[TRANSPORTES][CERRAR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// Tilde por depósito: ¿verifica productos al despachar? (los socios: solo impresión)
+app.post('/api/despacho/depositos-ml/verifica', async (req, res) => {
+  try {
+    const id = String((req.body && req.body.ml_address_id) || '').trim();
+    if (!id) return res.status(400).json({ error: 'Falta el ID del depósito' });
+    const valor = !!(req.body && req.body.verifica);
+    const { error } = await supabase.from('dep_depositos').update({ verifica: valor }).eq('ml_address_id', id);
+    if (error) throw new Error(error.message);
+    await cargarDepositosCfg();
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Historial de cierres (pagos hechos)
 app.get('/api/despacho/transportes/cierres', async (_req, res) => {
   try {
@@ -3717,7 +3753,7 @@ app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.70-depositos-agrupados', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.72-verifica-por-deposito', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

@@ -1355,6 +1355,33 @@ app.post('/api/despacho/separar-lote', async (req, res) => {
 });
 
 // ── Endpoints: impresión ──────────────────────────────────────────
+// Radiografía del filtro de depósitos (para diagnosticar ruteo)
+app.get('/api/despacho/diag-depcfg', async (req, res) => {
+  if ((req.query.clave || '') !== CLAVE_DIAG || !CLAVE_DIAG)
+    return res.status(401).json({ error: 'Falta la clave' });
+  try {
+    await cargarDepositosCfg();
+    const token = await getValidToken(ML_USER_ID);
+    const detallados = token ? await obtenerDetalladosConCache(token) : [];
+    const porDep = new Map();
+    for (const s of detallados) {
+      const k = s.dep_id ? String(s.dep_id) : '(vacío)';
+      let e = porDep.get(k);
+      if (!e) { e = { dep_id: k, dep_dir: s.dep_dir || '', total: 0, es_nuestro_true: 0, es_nuestro_false: 0, muestra: s.shipment_id }; porDep.set(k, e); }
+      e.total++;
+      if (s.es_nuestro === false) e.es_nuestro_false++; else e.es_nuestro_true++;
+    }
+    res.json({
+      principal_configurado: _depCfg.principalId || null,
+      filtro_texto: DEPOSITO_FILTRO || null,
+      depositos_vinculados: [..._depCfg.porId.values()].map(d => ({ id: d.ml_address_id, alias: d.alias, principal: !!d.es_principal, direccion: d.direccion })),
+      envios_en_cache: detallados.length,
+      por_deposito: [...porDep.values()].sort((a, b) => b.total - a.total),
+      nota: 'es_nuestro_true = entran a tu panel · si un dep_id ≠ principal tiene es_nuestro_true, ahí está el bug'
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── Depósitos de origen: qué está entrando y qué queda afuera ─────
 app.get('/api/despacho/depositos', async (_req, res) => {
   try {
@@ -3622,7 +3649,7 @@ app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.62-insert-blindado', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.63-diag-ruteo', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalId ? nombreDeposito(_depCfg.principalId, null) + ' (ID ' + _depCfg.principalId + ')' : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

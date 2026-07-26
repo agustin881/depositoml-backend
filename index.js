@@ -587,19 +587,35 @@ const ordenarPorSku = (a, b) => {
 // así el "Buscar pendientes" responde al instante.
 const CACHE_TTL_MS   = parseInt(process.env.CACHE_MINUTOS || '5', 10) * 60 * 1000;
 const PRECARGA_DESDE = process.env.PRECARGA_DESDE || '06:30';   // hora argentina
-const PRECARGA_HASTA = process.env.PRECARGA_HASTA || '19:00';
+const PRECARGA_HASTA = process.env.PRECARGA_HASTA || '23:30';
 const PRECARGA_MIN   = parseInt(process.env.PRECARGA_MINUTOS || '5', 10);
 
 let _envCache = { at: 0, detallados: null };
 function invalidarCacheEnvios() { _envCache = { at: 0, detallados: null }; } // ej.: al cambiar el depósito principal
 
+let _envInflight = null;     // recorrida en curso (candado: UNA sola a la vez)
+let _envRefrescando = false; // para avisarle al frontend que hay refresh de fondo
+
+function _lanzarRecorrida(token) {
+  if (_envInflight) return _envInflight;
+  _envRefrescando = true;
+  _envInflight = obtenerShipmentsDetallados(token)
+    .then(d => { _envCache = { at: Date.now(), detallados: d }; return d; })
+    .finally(() => { _envInflight = null; _envRefrescando = false; });
+  return _envInflight;
+}
+
 async function obtenerDetalladosConCache(token, forzar = false) {
-  if (!forzar && _envCache.detallados && Date.now() - _envCache.at < CACHE_TTL_MS) {
+  const fresco = _envCache.detallados && Date.now() - _envCache.at < CACHE_TTL_MS;
+  if (!forzar && fresco) return _envCache.detallados;
+  // Caché vencido pero existente → lo servimos YA y refrescamos de fondo.
+  // Así la vista de otros depósitos responde al instante en vez de esperar minutos.
+  if (!forzar && _envCache.detallados) {
+    const p = _lanzarRecorrida(token); p.catch(e => console.error('[CACHE][fondo]', e.message));
     return _envCache.detallados;
   }
-  const detallados = await obtenerShipmentsDetallados(token);
-  _envCache = { at: Date.now(), detallados };
-  return detallados;
+  // Sin caché (primer arranque) o refresh forzado: una sola recorrida compartida
+  return _lanzarRecorrida(token);
 }
 
 let _precargando = false;
@@ -1755,6 +1771,8 @@ app.get('/api/despacho/pendientes', async (req, res) => {
     const { listos, programados, no_listos } = await obtenerEnvios(tipo, deposito);
     res.json({
       tipo, deposito, cantidad: listos.length,
+      actualizado: _envCache.at ? new Date(_envCache.at).toISOString() : null,
+      refrescando: _envRefrescando,
       listos: listos.map(({ shipment_id, nro_venta, sku, titulo, unidades }) =>
         ({ shipment_id, nro_venta, sku, titulo, unidades })),
       programados: programados.map(({ shipment_id, nro_venta, sku, titulo, unidades, limite }) =>
@@ -3753,7 +3771,7 @@ app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.72-verifica-por-deposito', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.73-cache-rapido', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

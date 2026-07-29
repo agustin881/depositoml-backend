@@ -3792,7 +3792,7 @@ app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.75-auditoria-verificacion', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.76-mantenimiento', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;
@@ -3809,5 +3809,25 @@ async function purgarWebhooks() {
 }
 setTimeout(purgarWebhooks, 60 * 1000);            // una pasada al minuto de arrancar
 setInterval(purgarWebhooks, 6 * 60 * 60 * 1000);  // y después cada 6 horas
+
+// ── Purga de la foto local: envíos TERMINADOS (entregados/cancelados) con más de
+//    N días se limpian para que dep_envios no crezca para siempre (20k/mes).
+//    El Seguimiento de los últimos N días queda intacto. dep_despachos NO se toca
+//    (es la auditoría de pagos de transportes).
+const FOTO_DIAS_RETENCION = parseInt(process.env.FOTO_DIAS_RETENCION || '45', 10);
+async function purgarFotoVieja() {
+  try {
+    const corte = new Date(Date.now() - FOTO_DIAS_RETENCION * 86400000).toISOString();
+    const { error: e1 } = await supabase.from('dep_envios').delete()
+      .or('status.eq.delivered,cancelada.eq.true')
+      .lt('actualizado_at', corte);
+    const corteImp = new Date(Date.now() - 60 * 86400000).toISOString();
+    const { error: e2 } = await supabase.from('dep_impresiones').delete().lt('impreso_at', corteImp);
+    if (e1 || e2) console.error('[PURGA][foto]', (e1 && e1.message) || '', (e2 && e2.message) || '');
+    else console.log(`[PURGA] foto: envíos terminados > ${FOTO_DIAS_RETENCION} días e impresiones > 60 días, limpiados`);
+  } catch (e) { console.error('[PURGA][foto]', e.message); }
+}
+setTimeout(purgarFotoVieja, 90 * 1000);
+setInterval(purgarFotoVieja, 12 * 3600 * 1000);
 
 app.listen(PORT, () => console.log(`Depósito backend escuchando en :${PORT}`));

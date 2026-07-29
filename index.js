@@ -593,6 +593,7 @@ const PRECARGA_MIN   = parseInt(process.env.PRECARGA_MINUTOS || '5', 10);
 let _envCache = { at: 0, detallados: null };
 function invalidarCacheEnvios() { _envCache = { at: 0, detallados: null }; } // ej.: al cambiar el depósito principal
 
+const _scanMemo = new Map(); // codigo escaneado → { s, t } (evita re-consultar ML en la verificación)
 let _envInflight = null;     // recorrida en curso (candado: UNA sola a la vez)
 let _envRefrescando = false; // para avisarle al frontend que hay refresh de fondo
 
@@ -2680,7 +2681,19 @@ app.post('/api/despacho/despachar', async (req, res) => {
         destino_nombre: destino ? destino.nombre : null, ...base });
     }
 
-    const s = await resolverEscaneo(codigo, token);
+    // ⚡ Memoria de escaneos (90s): la fase de verificación (2do pedido con el EAN
+    //    o el código de aprobación) reusa el envío ya resuelto — sin volver a ML.
+    let s = null;
+    const esSegundaFase = !!(req.body && (req.body.verif_codigo || req.body.verificado));
+    const memoScan = _scanMemo.get(codigo);
+    if (esSegundaFase && memoScan && Date.now() - memoScan.t < 90000) s = memoScan.s;
+    if (!s) {
+      s = await resolverEscaneo(codigo, token);
+      if (s && s.shipment_id) {
+        _scanMemo.set(codigo, { s, t: Date.now() });
+        if (_scanMemo.size > 400) { let i = 0; for (const k of _scanMemo.keys()) { _scanMemo.delete(k); if (++i >= 100) break; } }
+      }
+    }
     if (!s) return res.status(404).json({ error: 'No pude interpretar el código. Probá con el número de venta o el número de envío de la etiqueta.' });
 
     // Estado actual de la VENTA (¿la cancelaron mientras preparábamos?)
@@ -3771,7 +3784,7 @@ app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.73-cache-rapido', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.74-llamado-rapido', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

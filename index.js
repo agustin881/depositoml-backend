@@ -2846,7 +2846,7 @@ app.post('/api/despacho/despachar', async (req, res) => {
 app.get('/api/despacho/despachados', async (_req, res) => {
   try {
     const { data: desp, error } = await supabase.from('dep_despachos')
-      .select('shipment_id,nro_venta,sku,titulo,tipo,usuario,colecta_carrier,colecta_patente,despachado_at')
+      .select('shipment_id,nro_venta,sku,titulo,tipo,usuario,colecta_carrier,colecta_patente,despachado_at,verificacion')
       .gte('despachado_at', inicioDeHoyART())
       .order('despachado_at', { ascending: false });
     if (error) throw new Error(error.message);
@@ -2941,7 +2941,15 @@ app.get('/api/despacho/despachados', async (_req, res) => {
     for (const r of despUnicas.values()) { if (porTipo[r.tipo]) porTipo[r.tipo].escaneadas++; }
     for (const s of faltan) { if (porTipo[s.tipo]) porTipo[s.tipo].pendientes++; }
 
+    // Auditoría de verificación del día: por EAN, con código de aprobación, o sin verificar
+    const verif = { ean: 0, aprobado: 0, sin: 0 };
+    for (const x of (desp || [])) {
+      if (x.verificacion === 'ean') verif.ean++;
+      else if (x.verificacion === 'aprobado') verif.aprobado++;
+      else verif.sin++;
+    }
     res.json({
+      verif,
       impresas_hoy: impUnicas.size,
       despachadas_hoy: despIds.size,
       faltan_cnt: faltan.length,
@@ -3784,7 +3792,7 @@ app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.74-llamado-rapido', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.75-auditoria-verificacion', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

@@ -1002,14 +1002,17 @@ app.get('/api/despacho/foto/estado', async (_req, res) => {
 //      · FLEX: no aplica corte de colecta → HOY.
 // corteHoyART: { fecha:'YYYY-MM-DD', corte:'HH:MM' } de la última colecta de hoy (o null).
 function cuandoDespacho(s, hoy, corteCol) {
+  // 1) LA PROMESA DE ML MANDA: si el envío trae la fecha real de despacho
+  //    (buffering.date / estimated_handling_limit), esa es la colecta que lo lleva.
+  //    Ejemplo real: venta a las 12:28 con pay_before de hoy, pero la colecta ya
+  //    pasó → ML promete "mañana" en el límite. Antes la contábamos HOY (mal).
+  const lim = s.limite ? String(s.limite).substring(0, 10) : null;
+  if (lim && lim > hoy) return 'manana';
+  if (lim && lim === hoy) return 'hoy';
+  // 2) Respaldo cuando ML no manda el límite: pay_before
   const pb = s.pay_before ? String(s.pay_before).substring(0, 10) : null;
   if (pb && pb > hoy) return 'manana';        // corte a futuro
   if (pb && pb === hoy) return 'hoy';          // corte de hoy
-  // pay_before viejo (anterior a hoy) o sin dato:
-  // 1) Si ML informa la fecha real de despacho (estimated_handling_limit) y es futura,
-  //    la colecta lo lleva otro día (típico de ventas programadas recién liberadas).
-  const lim = s.limite ? String(s.limite).substring(0, 10) : null;
-  if (lim && lim > hoy) return 'manana';
   // 2) Colecta liberada hoy después del corte → mañana
   if (s.tipo === 'colecta' && corteCol && corteCol.corte && s.date_handling) {
     const libDia = fechaDeART(s.date_handling);
@@ -3792,7 +3795,7 @@ app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.76-mantenimiento', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.77-limite-manda', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

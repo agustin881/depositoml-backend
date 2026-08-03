@@ -1009,10 +1009,21 @@ function cuandoDespacho(s, hoy, corteCol) {
   const lim = s.limite ? String(s.limite).substring(0, 10) : null;
   if (lim && lim > hoy) return 'manana';
   if (lim && lim === hoy) return 'hoy';
-  // 2) Respaldo cuando ML no manda el límite: pay_before
+  // 2) Respaldo cuando ML no manda el límite: pay_before.
+  //    OJO: pay_before trae LA HORA DE CORTE de la colecta (ej. hoy 10:00).
+  //    Si el envío quedó listo DESPUÉS de esa hora, lo lleva la colecta de MAÑANA
+  //    (verificado con venta real: corte 10:00, lista 11:14 → ML dice "mañana").
   const pb = s.pay_before ? String(s.pay_before).substring(0, 10) : null;
   if (pb && pb > hoy) return 'manana';        // corte a futuro
-  if (pb && pb === hoy) return 'hoy';          // corte de hoy
+  if (pb && pb === hoy) {
+    const listoEn = s.date_handling || null;
+    if (listoEn) {
+      try {
+        if (new Date(listoEn).getTime() > new Date(s.pay_before).getTime()) return 'manana';
+      } catch (e) { /* fecha rara → criterio conservador: hoy */ }
+    }
+    return 'hoy';
+  }
   // 2) Colecta liberada hoy después del corte → mañana
   if (s.tipo === 'colecta' && corteCol && corteCol.corte && s.date_handling) {
     const libDia = fechaDeART(s.date_handling);
@@ -3795,7 +3806,7 @@ app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.77-limite-manda', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.78-corte-por-hora', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

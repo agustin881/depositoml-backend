@@ -2641,6 +2641,14 @@ app.post('/api/despacho/despachar', async (req, res) => {
           if (p) return res.json({ resultado: 'producto', sku: p.sku, ean: p.ean || null,
             mensaje: 'Producto en mano — ahora escaneá la etiqueta del paquete' });
         }
+        // ¿Escanearon el CÓDIGO DE APROBACIÓN antes que la etiqueta? → aprobación en mano
+        if (!codigo.startsWith('{')) {
+          const codA0 = await codigoAprobacion();
+          if (codA0 && codigo.trim().toUpperCase() === String(codA0).trim().toUpperCase()) {
+            return res.json({ resultado: 'aprobacion',
+              mensaje: 'Aprobación en mano — ahora escaneá la etiqueta del paquete' });
+          }
+        }
       }
     } catch (e) { /* si falla, sigue el flujo normal */ }
 
@@ -2780,12 +2788,17 @@ app.post('/api/despacho/despachar', async (req, res) => {
               const okEan = p.ean && digE && digE === String(p.ean).replace(/[^0-9]/g, '');
               const okSku = escaneo.toUpperCase() === p.sku;
               const codA = await codigoAprobacion();
-              const okAprob = codA && escaneo === codA;
+              const normCod = t => String(t || '').trim().toUpperCase();
+              const okAprob = codA && normCod(escaneo) === normCod(codA);
               if (okEan || okSku) req._verifTipo = 'ean';
               else if (okAprob) req._verifTipo = 'aprobado';
-              else return res.json({ resultado: 'producto_equivocado',
-                mensaje: 'Ese código no es el producto esperado ni el de aprobación',
-                esperado_sku: p.sku, esperado_ean: p.ean || null, ...base });
+              else {
+                console.log(`[VERIF] rechazado: esperaba EAN ${p.ean || '—'} / SKU ${p.sku} / aprobación ${codA ? 'configurada' : 'SIN CONFIGURAR'} · recibí "${escaneo.slice(0, 30)}"`);
+                return res.json({ resultado: 'producto_equivocado',
+                  mensaje: 'Ese código no es el producto esperado ni el de aprobación',
+                  esperado_sku: p.sku, esperado_ean: p.ean || null,
+                  recibido: escaneo.slice(0, 30), ...base });
+              }
             } else {
               // 2) ¿Vino un producto en mano (escaneado antes que la etiqueta)?
               const manoEan = String((req.body && req.body.producto_ean) || '').replace(/[^0-9]/g, '');
@@ -3806,7 +3819,7 @@ app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.78-corte-por-hora', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.79-aprobacion-blindada', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

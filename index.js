@@ -222,6 +222,16 @@ async function requireAuth(req, res, next) {
       return res.status(403).json({ error: 'Sin acceso a Pagos de envíos (se habilita en Pontec OS → Usuarios)' });
     if (req.path.startsWith('/full') && !req.pestLog.includes('full'))
       return res.status(403).json({ error: 'Sin acceso a Envíos Full (se habilita en Pontec OS → Usuarios)' });
+    // Catálogo de productos y llave de verificación:
+    //  · lectura (buscar / resolver del Verificador) → Herramientas o Configuración
+    //  · escritura (importar, editar, borrar, llave, código) → solo Configuración
+    if (req.path.startsWith('/productos') || req.path.startsWith('/verificacion')) {
+      const esConfig = req.pestLog.includes('config');
+      const esHerr = req.pestLog.includes('full');
+      const soloLectura = req.method === 'GET' && (req.path === '/productos' || req.path === '/productos/resolver');
+      if (soloLectura ? !(esConfig || esHerr) : !esConfig)
+        return res.status(403).json({ error: 'Sin permiso para el catálogo de productos (se habilita en Pontec OS → Usuarios)' });
+    }
     next();
   } catch (e) { return res.status(401).json({ error: 'No autorizado' }); }
 }
@@ -3839,7 +3849,7 @@ app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.80-verificador', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.81-catalogo-protegido', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

@@ -1680,6 +1680,26 @@ app.get('/api/despacho/productos', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Verificador (banco de pruebas): ¿qué devuelve el catálogo para este código?
+// Usa la MISMA lógica que la verificación real de Despachar.
+app.get('/api/despacho/productos/resolver', async (req, res) => {
+  try {
+    const codigo = String(req.query.codigo || '').trim();
+    if (!codigo) return res.status(400).json({ error: 'Falta el código' });
+    const codA = await codigoAprobacion();
+    if (codA && codigo.toUpperCase() === String(codA).trim().toUpperCase())
+      return res.json({ tipo: 'aprobacion' });
+    await catalogoProductos();
+    const dig = codigo.replace(/[^0-9]/g, '');
+    const porEan = _prodCache.porEan || new Map();
+    let p = dig ? porEan.get(dig) : null;
+    let via = p ? 'ean' : null;
+    if (!p) { p = (_prodCache.map || new Map()).get(codigo.toUpperCase()); via = p ? 'sku' : null; }
+    if (p) return res.json({ tipo: 'producto', via, sku: p.sku, ean: p.ean || null, requiere: p.requiere !== false });
+    res.json({ tipo: 'desconocido', digitos: dig || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Importación masiva: una línea por producto → SKU [tab/;/,] EAN [tab/;/, no]
 app.post('/api/despacho/productos/importar', async (req, res) => {
   try {
@@ -3819,7 +3839,7 @@ app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.79-aprobacion-blindada', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.80-verificador', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

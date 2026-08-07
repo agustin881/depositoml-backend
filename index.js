@@ -163,24 +163,46 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 // ── Middleware: exige usuario logueado (token de Supabase) ────────
 // ── Registro central Pontec OS: valida rol/apps contra MargenML (/api/mi-rol) ──
 const MARGEN_BACKEND = (process.env.MARGEN_BACKEND_URL || 'https://margenml-backend-production.up.railway.app').replace(/\/$/, '');
-const _rolCache = new Map(); // email → { t, ok, rol }  (caché 5 min para no pegarle en cada request)
+const _rolCache = new Map(); // email → { t, ok, rol, pest }  (caché 5 min SOLO de respuestas buenas)
 async function accesoLogisticaCentral(token, email) {
   const c = _rolCache.get(email);
   if (c && Date.now() - c.t < 5 * 60 * 1000) return c;
-  const out = { t: Date.now(), ok: null, rol: null }; // ok=null → central no disponible
+  const out = { t: Date.now(), ok: null, rol: null, pest: null }; // ok=null → central no disponible
+
+  // 1) Intento principal: preguntarle a MargenML (fuente de verdad de roles/apps)
   try {
     const r = await fetch(`${MARGEN_BACKEND}/api/mi-rol`, { headers: { Authorization: `Bearer ${token}` } });
     if (r.ok) {
       const d = await r.json();
       if (d && d.rol) {
         out.rol = d.rol;
-        const apps = (d.apps && d.apps.length) ? d.apps : null; // sin lista propia → apps según rol (todas incluyen logística)
+        const apps = (d.apps && d.apps.length) ? d.apps : null;
         out.ok = apps ? apps.includes('logistica') : true;
         out.pest = (d.pestanas_logistica && d.pestanas_logistica.length) ? d.pestanas_logistica : null;
       } else out.ok = false; // el central respondió pero el usuario no está registrado
     }
-  } catch (e) { /* central caído → out.ok queda null y usamos el fallback */ }
-  _rolCache.set(email, out);
+  } catch (e) { /* central caído → probamos el respaldo de abajo */ }
+
+  // 2) Respaldo: si el central no resolvió (timeout, 401 por token, etc.), leemos
+  //    el rol y las pestañas DIRECTO de mml_roles en Supabase. Así una falla
+  //    puntual de /api/mi-rol no le esconde pestañas a un usuario válido.
+  if (out.ok === null || (out.ok === true && !out.pest)) {
+    try {
+      const { data: rr } = await supabase.from('mml_roles')
+        .select('rol,apps,pestanas_logistica').eq('email', email).single();
+      if (rr && rr.rol) {
+        out.rol = rr.rol;
+        const apps = (rr.apps && rr.apps.length) ? rr.apps : null;
+        out.ok = apps ? apps.includes('logistica') : true;
+        if (rr.pestanas_logistica && rr.pestanas_logistica.length) out.pest = rr.pestanas_logistica;
+      } else if (out.ok === null) {
+        out.ok = false; // no está en la tabla → sin acceso
+      }
+    } catch (e) { /* si Supabase también falla, queda el fallback local de requireAuth */ }
+  }
+
+  // Solo cacheamos respuestas concluyentes (nunca un fallo transitorio con ok=null)
+  if (out.ok !== null) _rolCache.set(email, out);
   return out;
 }
 

@@ -1829,6 +1829,9 @@ app.post('/api/despacho/productos/borrar', async (req, res) => {
 
 // Qué pestañas de Logística ve este usuario (resueltas por requireAuth)
 app.get('/api/despacho/mis-pestanas', (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
   res.json({ rol: req.rol || null, pestanas: req.pestLog || [] });
 });
 

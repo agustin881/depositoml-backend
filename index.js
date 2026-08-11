@@ -163,52 +163,30 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 // ── Middleware: exige usuario logueado (token de Supabase) ────────
 // ── Registro central Pontec OS: valida rol/apps contra MargenML (/api/mi-rol) ──
 const MARGEN_BACKEND = (process.env.MARGEN_BACKEND_URL || 'https://margenml-backend-production.up.railway.app').replace(/\/$/, '');
-const _rolCache = new Map(); // email → { t, ok, rol, pest }  (caché 5 min SOLO de respuestas buenas)
+const _rolCache = new Map(); // email → { t, ok, rol }  (caché 5 min para no pegarle en cada request)
 async function accesoLogisticaCentral(token, email) {
   const c = _rolCache.get(email);
   if (c && Date.now() - c.t < 5 * 60 * 1000) return c;
-  const out = { t: Date.now(), ok: null, rol: null, pest: null }; // ok=null → central no disponible
-
-  // 1) Intento principal: preguntarle a MargenML (fuente de verdad de roles/apps)
+  const out = { t: Date.now(), ok: null, rol: null }; // ok=null → central no disponible
   try {
     const r = await fetch(`${MARGEN_BACKEND}/api/mi-rol`, { headers: { Authorization: `Bearer ${token}` } });
     if (r.ok) {
       const d = await r.json();
       if (d && d.rol) {
         out.rol = d.rol;
-        const apps = (d.apps && d.apps.length) ? d.apps : null;
+        const apps = (d.apps && d.apps.length) ? d.apps : null; // sin lista propia → apps según rol (todas incluyen logística)
         out.ok = apps ? apps.includes('logistica') : true;
         out.pest = (d.pestanas_logistica && d.pestanas_logistica.length) ? d.pestanas_logistica : null;
       } else out.ok = false; // el central respondió pero el usuario no está registrado
     }
-  } catch (e) { /* central caído → probamos el respaldo de abajo */ }
-
-  // 2) Respaldo: si el central no resolvió (timeout, 401 por token, etc.), leemos
-  //    el rol y las pestañas DIRECTO de mml_roles en Supabase. Así una falla
-  //    puntual de /api/mi-rol no le esconde pestañas a un usuario válido.
-  if (out.ok === null || (out.ok === true && !out.pest)) {
-    try {
-      const { data: rr } = await supabase.from('mml_roles')
-        .select('rol,apps,pestanas_logistica').eq('email', email).single();
-      if (rr && rr.rol) {
-        out.rol = rr.rol;
-        const apps = (rr.apps && rr.apps.length) ? rr.apps : null;
-        out.ok = apps ? apps.includes('logistica') : true;
-        if (rr.pestanas_logistica && rr.pestanas_logistica.length) out.pest = rr.pestanas_logistica;
-      } else if (out.ok === null) {
-        out.ok = false; // no está en la tabla → sin acceso
-      }
-    } catch (e) { /* si Supabase también falla, queda el fallback local de requireAuth */ }
-  }
-
-  // Solo cacheamos respuestas concluyentes (nunca un fallo transitorio con ok=null)
-  if (out.ok !== null) _rolCache.set(email, out);
+  } catch (e) { /* central caído → out.ok queda null y usamos el fallback */ }
+  _rolCache.set(email, out);
   return out;
 }
 
 // Pestañas de Logística por defecto según el rol (igual que el hub)
 function pestLogPorRol(rol) {
-  if (rol === 'admin') return ['imprimir','despachar','seguimiento','full','pagos','config'];
+  if (rol === 'admin') return ['imprimir','despachar','seguimiento','full','pagos','config','wms'];
   if (rol === 'encargado') return ['imprimir','despachar','seguimiento','full','config'];
   return ['imprimir','despachar','seguimiento'];
 }
@@ -242,6 +220,13 @@ async function requireAuth(req, res, next) {
     // Bloqueo en el servidor de las secciones sensibles (además de ocultarlas en pantalla)
     if (req.path.startsWith('/transportes') && !req.pestLog.includes('pagos'))
       return res.status(403).json({ error: 'Sin acceso a Pagos de envíos (se habilita en Pontec OS → Usuarios)' });
+    if (req.path.startsWith('/wms')) {
+      if (!req.pestLog.includes('wms'))
+        return res.status(403).json({ error: 'Sin acceso al WMS (se habilita en Pontec OS → Usuarios)' });
+      // Crear/borrar ubicaciones (la estructura física): solo quien ve Ajustes
+      if (req.path.startsWith('/wms/ubicaciones') && req.method !== 'GET' && !req.pestLog.includes('config'))
+        return res.status(403).json({ error: 'Solo quien ve Ajustes puede crear o borrar ubicaciones' });
+    }
     if (req.path.startsWith('/full') && !req.pestLog.includes('full'))
       return res.status(403).json({ error: 'Sin acceso a Envíos Full (se habilita en Pontec OS → Usuarios)' });
     // Catálogo de productos y llave de verificación:
@@ -1829,9 +1814,6 @@ app.post('/api/despacho/productos/borrar', async (req, res) => {
 
 // Qué pestañas de Logística ve este usuario (resueltas por requireAuth)
 app.get('/api/despacho/mis-pestanas', (req, res) => {
-  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.set('Pragma', 'no-cache');
-  res.set('Expires', '0');
   res.json({ rol: req.rol || null, pestanas: req.pestLog || [] });
 });
 
@@ -3875,7 +3857,314 @@ app.post('/api/despacho/transportes/cierres/borrar', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.82-pulido-auditoria', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
+// ══════════════════════════════════════════════════════════════════
+//  WMS · ubicaciones con stock (tablas dep_wms_*)
+//  Código de ubicación: Rack-Columna-Estante (ej. A-03-2). En el rack va
+//  impresa la etiqueta "UB:A-03-2" (el prefijo evita confundirla con un SKU).
+//  Todo bajo /api/despacho/wms → requireAuth exige la pestaña 'wms';
+//  crear/borrar ubicaciones exige además 'config'.
+// ══════════════════════════════════════════════════════════════════
+
+// "ub:a-03-2" / "A-03-2" → "A-03-2" (o null si viene vacío)
+function wmsNormalizarUbi(txt) {
+  let c = String(txt || '').trim().toUpperCase();
+  if (c.startsWith('UB:')) c = c.slice(3).trim();
+  return c || null;
+}
+const WMS_SANO = s => String(s || '').replace(/[^0-9A-Za-z_\-\.]/g, '').toUpperCase();
+
+// Trae TODO el stock (paginado por el tope de 1000 de PostgREST)
+async function wmsStockTodo(filtro) {
+  let out = [], from = 0; const size = 1000;
+  for (;;) {
+    let q = supabase.from('dep_wms_stock').select('ubicacion,sku,cantidad,actualizado_at').range(from, from + size - 1);
+    if (filtro && filtro.sku) q = q.eq('sku', filtro.sku);
+    if (filtro && filtro.ubicacion) q = q.eq('ubicacion', filtro.ubicacion);
+    const { data, error } = await q;
+    if (error) throw new Error(error.message);
+    out = out.concat(data || []);
+    if (!data || data.length < size) break;
+    from += size; if (from > 50000) break;
+  }
+  return out;
+}
+
+async function wmsLogMov(tipo, sku, cantidad, desde, hacia, usuario) {
+  try {
+    await supabase.from('dep_wms_movimientos').insert({ tipo, sku, cantidad, desde: desde || null, hacia: hacia || null, usuario: usuario || null });
+  } catch (e) { console.error('[WMS][MOV]', e.message); }
+}
+
+// Resumen general (para las tarjetas de arriba de la pestaña)
+app.get('/api/despacho/wms/resumen', async (_req, res) => {
+  try {
+    const { count: ubis } = await supabase.from('dep_wms_ubicaciones').select('codigo', { count: 'exact', head: true });
+    const stock = await wmsStockTodo();
+    const conAlgo = new Set(); const skus = new Set(); let unidades = 0;
+    for (const s of stock) if (s.cantidad > 0) { conAlgo.add(s.ubicacion); skus.add(s.sku); unidades += s.cantidad; }
+    res.json({ ubicaciones: ubis || 0, ocupadas: conAlgo.size, skus: skus.size, unidades });
+  } catch (e) { console.error('[WMS][RESUMEN]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Lista de ubicaciones agrupadas por rack (con cuánto tiene cada una)
+app.get('/api/despacho/wms/ubicaciones', async (_req, res) => {
+  try {
+    let ubis = [], from = 0;
+    for (;;) {
+      const { data, error } = await supabase.from('dep_wms_ubicaciones')
+        .select('codigo,rack,columna,estante,notas').order('codigo').range(from, from + 999);
+      if (error) throw new Error(error.message);
+      ubis = ubis.concat(data || []);
+      if (!data || data.length < 1000) break;
+      from += 1000;
+    }
+    const stock = await wmsStockTodo();
+    const porUbi = new Map();
+    for (const s of stock) {
+      if (!(s.cantidad > 0)) continue;
+      let e = porUbi.get(s.ubicacion);
+      if (!e) { e = { skus: 0, unidades: 0 }; porUbi.set(s.ubicacion, e); }
+      e.skus++; e.unidades += s.cantidad;
+    }
+    const lista = ubis.map(u => ({ ...u, skus: (porUbi.get(u.codigo) || {}).skus || 0, unidades: (porUbi.get(u.codigo) || {}).unidades || 0 }));
+    res.json({ total: lista.length, ubicaciones: lista });
+  } catch (e) { console.error('[WMS][UBIS]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Crear ubicaciones: un rack completo de una (rack + columnas + estantes)
+// o una puntual ({codigo}). No pisa las existentes.
+app.post('/api/despacho/wms/ubicaciones', async (req, res) => {
+  try {
+    const b = req.body || {};
+    let filas = [];
+    if (b.codigo) {
+      const codigo = wmsNormalizarUbi(b.codigo);
+      if (!codigo) return res.status(400).json({ error: 'Código vacío' });
+      const partes = codigo.split('-');
+      filas = [{ codigo, rack: partes[0] || codigo, columna: partes[1] || '-', estante: partes[2] || '-', notas: (b.notas || '').trim() || null }];
+    } else {
+      const rack = WMS_SANO(b.rack).slice(0, 6);
+      const columnas = parseInt(b.columnas, 10) || 0;
+      const estantes = parseInt(b.estantes, 10) || 0;
+      if (!rack) return res.status(400).json({ error: 'Falta el nombre del rack (ej. A)' });
+      if (columnas < 1 || columnas > 60) return res.status(400).json({ error: 'Columnas: entre 1 y 60' });
+      if (estantes < 1 || estantes > 20) return res.status(400).json({ error: 'Estantes: entre 1 y 20' });
+      if (columnas * estantes > 800) return res.status(400).json({ error: 'Demasiadas ubicaciones de una (máx. 800). Hacelo en dos tandas.' });
+      for (let c = 1; c <= columnas; c++)
+        for (let e = 1; e <= estantes; e++)
+          filas.push({ codigo: `${rack}-${String(c).padStart(2, '0')}-${e}`, rack, columna: String(c).padStart(2, '0'), estante: String(e), notas: null });
+    }
+    const { error } = await supabase.from('dep_wms_ubicaciones')
+      .upsert(filas, { onConflict: 'codigo', ignoreDuplicates: true });
+    if (error) throw new Error(error.message);
+    console.log(`[WMS] ubicaciones creadas/aseguradas: ${filas.length} por ${(req.authUser && req.authUser.email) || '?'}`);
+    res.json({ ok: true, creadas: filas.length, codigos: filas.map(f => f.codigo) });
+  } catch (e) { console.error('[WMS][UBIS-CREAR]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Borrar una ubicación (solo si está vacía) o un rack entero vacío
+app.post('/api/despacho/wms/ubicaciones/borrar', async (req, res) => {
+  try {
+    const codigo = wmsNormalizarUbi((req.body && req.body.codigo) || '');
+    const rack = WMS_SANO((req.body && req.body.rack) || '');
+    if (!codigo && !rack) return res.status(400).json({ error: 'Indicá el código de la ubicación o el rack' });
+    let codigos = [];
+    if (codigo) codigos = [codigo];
+    else {
+      const { data } = await supabase.from('dep_wms_ubicaciones').select('codigo').eq('rack', rack);
+      codigos = (data || []).map(x => x.codigo);
+      if (!codigos.length) return res.status(404).json({ error: `No hay ubicaciones del rack ${rack}` });
+    }
+    const { data: st } = await supabase.from('dep_wms_stock').select('ubicacion,cantidad').in('ubicacion', codigos).gt('cantidad', 0);
+    if (st && st.length) {
+      const conStock = [...new Set(st.map(x => x.ubicacion))];
+      return res.status(409).json({ error: `Hay stock en: ${conStock.slice(0, 8).join(', ')}${conStock.length > 8 ? '…' : ''}. Sacalo o movelo antes de borrar.` });
+    }
+    await supabase.from('dep_wms_stock').delete().in('ubicacion', codigos); // filas en 0
+    const { error } = await supabase.from('dep_wms_ubicaciones').delete().in('codigo', codigos);
+    if (error) throw new Error(error.message);
+    res.json({ ok: true, borradas: codigos.length });
+  } catch (e) { console.error('[WMS][UBIS-BORRAR]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Resolver un escaneo: ¿es una ubicación o un producto?
+// Misma lógica de catálogo que Despachar (EAN por dígitos, SKU exacto).
+app.get('/api/despacho/wms/resolver', async (req, res) => {
+  try {
+    const crudo = String(req.query.codigo || '').trim();
+    if (!crudo) return res.status(400).json({ error: 'Falta el código' });
+    // 1) ¿Ubicación? (con o sin prefijo UB:)
+    const ubi = wmsNormalizarUbi(crudo);
+    if (ubi) {
+      const { data } = await supabase.from('dep_wms_ubicaciones').select('codigo,rack,notas').eq('codigo', ubi).limit(1);
+      if (data && data[0]) {
+        const stock = (await wmsStockTodo({ ubicacion: ubi })).filter(s => s.cantidad > 0);
+        stock.sort((a, b) => b.cantidad - a.cantidad || a.sku.localeCompare(b.sku));
+        return res.json({ tipo: 'ubicacion', codigo: ubi, notas: data[0].notas || null,
+          contenido: stock.map(s => ({ sku: s.sku, cantidad: s.cantidad })) });
+      }
+      if (crudo.toUpperCase().startsWith('UB:'))
+        return res.json({ tipo: 'ubicacion_desconocida', codigo: ubi });
+    }
+    // 2) ¿Producto del catálogo? (EAN por dígitos o SKU exacto)
+    await catalogoProductos();
+    const dig = crudo.replace(/[^0-9]/g, '');
+    let p = (dig && _prodCache.porEan) ? _prodCache.porEan.get(dig) : null;
+    if (!p) p = (_prodCache.map || new Map()).get(crudo.toUpperCase());
+    const skuFinal = p ? p.sku : null;
+    // 3) Aunque no esté en el catálogo, puede tener stock guardado por SKU
+    const skuBuscar = skuFinal || crudo.toUpperCase();
+    const stock = (await wmsStockTodo({ sku: skuBuscar })).filter(s => s.cantidad > 0);
+    if (skuFinal || stock.length) {
+      stock.sort((a, b) => b.cantidad - a.cantidad || a.ubicacion.localeCompare(b.ubicacion));
+      return res.json({ tipo: 'producto', sku: skuBuscar, ean: p ? (p.ean || null) : null,
+        en_catalogo: !!skuFinal, total: stock.reduce((a, s) => a + s.cantidad, 0),
+        ubicaciones: stock.map(s => ({ ubicacion: s.ubicacion, cantidad: s.cantidad })) });
+    }
+    res.json({ tipo: 'desconocido', digitos: dig || null });
+  } catch (e) { console.error('[WMS][RESOLVER]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Búsqueda por texto: SKUs del stock que contengan lo tipeado
+app.get('/api/despacho/wms/buscar', async (req, res) => {
+  try {
+    const q = String(req.query.q || '').replace(/[,()%]/g, ' ').trim().toUpperCase();
+    if (!q) return res.status(400).json({ error: 'Escribí parte del SKU' });
+    const { data, error } = await supabase.from('dep_wms_stock')
+      .select('ubicacion,sku,cantidad').ilike('sku', `%${q}%`).gt('cantidad', 0).limit(400);
+    if (error) throw new Error(error.message);
+    const porSku = new Map();
+    for (const s of (data || [])) {
+      let e = porSku.get(s.sku);
+      if (!e) { e = { sku: s.sku, total: 0, ubicaciones: [] }; porSku.set(s.sku, e); }
+      e.total += s.cantidad; e.ubicaciones.push({ ubicacion: s.ubicacion, cantidad: s.cantidad });
+    }
+    const lista = [...porSku.values()].sort((a, b) => a.sku.localeCompare(b.sku)).slice(0, 60);
+    for (const e of lista) e.ubicaciones.sort((a, b) => b.cantidad - a.cantidad);
+    res.json({ resultados: lista });
+  } catch (e) { console.error('[WMS][BUSCAR]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Helper interno: sumar (o restar) stock en una ubicación. Devuelve la cantidad final.
+async function wmsAjustarStock(ubicacion, sku, delta) {
+  const { data } = await supabase.from('dep_wms_stock')
+    .select('id,cantidad').eq('ubicacion', ubicacion).eq('sku', sku).limit(1);
+  const fila = data && data[0];
+  const actual = fila ? (fila.cantidad || 0) : 0;
+  const nueva = actual + delta;
+  if (nueva < 0) throw new Error(`SIN_STOCK:${actual}`);
+  if (fila) {
+    if (nueva === 0) {
+      const { error } = await supabase.from('dep_wms_stock').delete().eq('id', fila.id);
+      if (error) throw new Error(error.message);
+    } else {
+      const { error } = await supabase.from('dep_wms_stock')
+        .update({ cantidad: nueva, actualizado_at: new Date().toISOString() }).eq('id', fila.id);
+      if (error) throw new Error(error.message);
+    }
+  } else if (nueva > 0) {
+    const { error } = await supabase.from('dep_wms_stock')
+      .insert({ ubicacion, sku, cantidad: nueva });
+    if (error) throw new Error(error.message);
+  }
+  return nueva;
+}
+
+// Validaciones comunes de entrada/salida/mover
+async function wmsValidar(req, conDestino) {
+  const b = req.body || {};
+  const sku = WMS_SANO(b.sku);
+  const cantidad = parseInt(b.cantidad, 10);
+  if (!sku) throw new Error('Falta el SKU del producto');
+  if (!cantidad || cantidad < 1 || cantidad > 99999) throw new Error('Cantidad inválida (1 a 99999)');
+  const chequear = async (campo, valor) => {
+    const cod = wmsNormalizarUbi(valor);
+    if (!cod) throw new Error(`Falta la ubicación (${campo})`);
+    const { data } = await supabase.from('dep_wms_ubicaciones').select('codigo').eq('codigo', cod).limit(1);
+    if (!data || !data[0]) throw new Error(`La ubicación ${cod} no existe. Creala en Ubicaciones o revisá la etiqueta.`);
+    return cod;
+  };
+  const out = { sku, cantidad };
+  if (conDestino === 'entrada') out.ubicacion = await chequear('destino', b.ubicacion);
+  if (conDestino === 'salida') out.ubicacion = await chequear('origen', b.ubicacion);
+  if (conDestino === 'mover') { out.desde = await chequear('origen', b.desde); out.hacia = await chequear('destino', b.hacia);
+    if (out.desde === out.hacia) throw new Error('Origen y destino son la misma ubicación'); }
+  return out;
+}
+
+// Entrada: guardar mercadería en una ubicación
+app.post('/api/despacho/wms/entrada', async (req, res) => {
+  try {
+    const { sku, cantidad, ubicacion } = await wmsValidar(req, 'entrada');
+    const final = await wmsAjustarStock(ubicacion, sku, cantidad);
+    await wmsLogMov('entrada', sku, cantidad, null, ubicacion, req.authUser && req.authUser.email);
+    console.log(`[WMS] entrada ${cantidad}× ${sku} → ${ubicacion} (queda ${final})`);
+    res.json({ ok: true, sku, ubicacion, cantidad, queda_en_ubicacion: final });
+  } catch (e) { console.error('[WMS][ENTRADA]', e.message); res.status(400).json({ error: e.message }); }
+});
+
+// Salida: sacar mercadería de una ubicación
+app.post('/api/despacho/wms/salida', async (req, res) => {
+  try {
+    const { sku, cantidad, ubicacion } = await wmsValidar(req, 'salida');
+    let final;
+    try { final = await wmsAjustarStock(ubicacion, sku, -cantidad); }
+    catch (e) {
+      if (String(e.message).startsWith('SIN_STOCK:')) {
+        const hay = e.message.split(':')[1];
+        return res.status(409).json({ error: `En ${ubicacion} hay ${hay} de ${sku} — no podés sacar ${cantidad}.`, disponible: parseInt(hay, 10) });
+      }
+      throw e;
+    }
+    await wmsLogMov('salida', sku, cantidad, ubicacion, null, req.authUser && req.authUser.email);
+    console.log(`[WMS] salida ${cantidad}× ${sku} ← ${ubicacion} (queda ${final})`);
+    res.json({ ok: true, sku, ubicacion, cantidad, queda_en_ubicacion: final });
+  } catch (e) { console.error('[WMS][SALIDA]', e.message); res.status(400).json({ error: e.message }); }
+});
+
+// Mover: de una ubicación a otra (resta en origen, suma en destino)
+app.post('/api/despacho/wms/mover', async (req, res) => {
+  try {
+    const { sku, cantidad, desde, hacia } = await wmsValidar(req, 'mover');
+    let quedaOrigen;
+    try { quedaOrigen = await wmsAjustarStock(desde, sku, -cantidad); }
+    catch (e) {
+      if (String(e.message).startsWith('SIN_STOCK:')) {
+        const hay = e.message.split(':')[1];
+        return res.status(409).json({ error: `En ${desde} hay ${hay} de ${sku} — no podés mover ${cantidad}.`, disponible: parseInt(hay, 10) });
+      }
+      throw e;
+    }
+    let quedaDestino;
+    try { quedaDestino = await wmsAjustarStock(hacia, sku, cantidad); }
+    catch (e) {
+      // Falló el destino → devolvemos el stock al origen para no perder unidades
+      try { await wmsAjustarStock(desde, sku, cantidad); } catch (_) { console.error('[WMS][MOVER] ⚠ no pude revertir el origen — revisá el stock de', desde, sku); }
+      throw e;
+    }
+    await wmsLogMov('mover', sku, cantidad, desde, hacia, req.authUser && req.authUser.email);
+    console.log(`[WMS] mover ${cantidad}× ${sku}: ${desde} → ${hacia}`);
+    res.json({ ok: true, sku, cantidad, desde, hacia, queda_en_origen: quedaOrigen, queda_en_destino: quedaDestino });
+  } catch (e) { console.error('[WMS][MOVER]', e.message); res.status(400).json({ error: e.message }); }
+});
+
+// Últimos movimientos (opcional ?sku= o ?ubicacion=)
+app.get('/api/despacho/wms/movimientos', async (req, res) => {
+  try {
+    const sku = WMS_SANO(req.query.sku || '') || null;
+    const ubi = wmsNormalizarUbi(req.query.ubicacion || '');
+    let q = supabase.from('dep_wms_movimientos')
+      .select('tipo,sku,cantidad,desde,hacia,usuario,hecho_at')
+      .order('hecho_at', { ascending: false }).limit(80);
+    if (sku) q = q.eq('sku', sku);
+    if (ubi) q = q.or(`desde.eq.${ubi},hacia.eq.${ubi}`);
+    const { data, error } = await q;
+    if (error) throw new Error(error.message);
+    res.json({ movimientos: data || [] });
+  } catch (e) { console.error('[WMS][MOVS]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.83-wms-v1', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

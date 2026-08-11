@@ -223,9 +223,12 @@ async function requireAuth(req, res, next) {
     if (req.path.startsWith('/wms')) {
       if (!req.pestLog.includes('wms'))
         return res.status(403).json({ error: 'Sin acceso al WMS (se habilita en Pontec OS → Usuarios)' });
-      // Crear/borrar ubicaciones (la estructura física): solo quien ve Ajustes
-      if (req.path.startsWith('/wms/ubicaciones') && req.method !== 'GET' && !req.pestLog.includes('config'))
-        return res.status(403).json({ error: 'Solo quien ve Ajustes puede crear o borrar ubicaciones' });
+      // La ESTRUCTURA (ubicaciones, módulos del plano, ajustes, permisos, pesos):
+      // solo quien ve Ajustes (config)
+      const esEstructura = ['/wms/ubicaciones', '/wms/modulos', '/wms/ajustes', '/wms/permisos', '/wms/peso']
+        .some(p => req.path.startsWith(p));
+      if (esEstructura && req.method !== 'GET' && !req.pestLog.includes('config'))
+        return res.status(403).json({ error: 'Solo quien ve Ajustes puede cambiar la estructura del WMS' });
     }
     if (req.path.startsWith('/full') && !req.pestLog.includes('full'))
       return res.status(403).json({ error: 'Sin acceso a Envíos Full (se habilita en Pontec OS → Usuarios)' });
@@ -3912,7 +3915,7 @@ app.get('/api/despacho/wms/ubicaciones', async (_req, res) => {
     let ubis = [], from = 0;
     for (;;) {
       const { data, error } = await supabase.from('dep_wms_ubicaciones')
-        .select('codigo,rack,columna,estante,notas').order('codigo').range(from, from + 999);
+        .select('codigo,rack,columna,estante,notas,modulo_id,nivel,rol').order('codigo').range(from, from + 999);
       if (error) throw new Error(error.message);
       ubis = ubis.concat(data || []);
       if (!data || data.length < 1000) break;
@@ -3996,12 +3999,32 @@ app.get('/api/despacho/wms/resolver', async (req, res) => {
     // 1) ¿Ubicación? (con o sin prefijo UB:)
     const ubi = wmsNormalizarUbi(crudo);
     if (ubi) {
-      const { data } = await supabase.from('dep_wms_ubicaciones').select('codigo,rack,notas').eq('codigo', ubi).limit(1);
-      if (data && data[0]) {
+      const info = await wmsUbiInfo(ubi);
+      if (info) {
         const stock = (await wmsStockTodo({ ubicacion: ubi })).filter(s => s.cantidad > 0);
         stock.sort((a, b) => b.cantidad - a.cantidad || a.sku.localeCompare(b.sku));
-        return res.json({ tipo: 'ubicacion', codigo: ubi, notas: data[0].notas || null,
+        return res.json({ tipo: 'ubicacion', codigo: ubi, rol: info.rol, nivel: info.nivel,
+          modulo: info.modulo ? info.modulo.nombre : null, tipo_modulo: info.tipo_modulo,
           contenido: stock.map(s => ({ sku: s.sku, cantidad: s.cantidad })) });
+      }
+      // ¿Es la etiqueta de un MÓDULO entero (ej. "UB:A")? → resumen del módulo
+      if (!ubi.includes('-')) {
+        const { data: m } = await supabase.from('dep_wms_modulos')
+          .select('id,nombre,tipo,niveles').eq('nombre', ubi).limit(1);
+        if (m && m[0]) {
+          const { data: ub2 } = await supabase.from('dep_wms_ubicaciones')
+            .select('codigo,rol,nivel').eq('modulo_id', m[0].id).order('codigo');
+          const codigos = (ub2 || []).map(x => x.codigo);
+          let st = [];
+          if (codigos.length) {
+            const { data: s2 } = await supabase.from('dep_wms_stock')
+              .select('ubicacion,sku,cantidad').in('ubicacion', codigos).gt('cantidad', 0);
+            st = s2 || [];
+          }
+          return res.json({ tipo: 'modulo', nombre: m[0].nombre, tipo_modulo: m[0].tipo, niveles: m[0].niveles,
+            ubicaciones: (ub2 || []).map(u => ({ codigo: u.codigo, rol: u.rol, nivel: u.nivel,
+              contenido: st.filter(x => x.ubicacion === u.codigo).map(x => ({ sku: x.sku, cantidad: x.cantidad })) })) });
+        }
       }
       if (crudo.toUpperCase().startsWith('UB:'))
         return res.json({ tipo: 'ubicacion_desconocida', codigo: ubi });
@@ -4017,9 +4040,19 @@ app.get('/api/despacho/wms/resolver', async (req, res) => {
     const stock = (await wmsStockTodo({ sku: skuBuscar })).filter(s => s.cantidad > 0);
     if (skuFinal || stock.length) {
       stock.sort((a, b) => b.cantidad - a.cantidad || a.ubicacion.localeCompare(b.ubicacion));
+      // Rol de cada ubicación donde está (para marcar 🚫 las de reserva)
+      const roles = new Map();
+      const cods = [...new Set(stock.map(s => s.ubicacion))];
+      if (cods.length) {
+        const { data: ur } = await supabase.from('dep_wms_ubicaciones').select('codigo,rol').in('codigo', cods);
+        for (const r of (ur || [])) roles.set(r.codigo, r.rol || 'picking');
+      }
+      const ubicaciones = stock.map(s => ({ ubicacion: s.ubicacion, cantidad: s.cantidad, rol: roles.get(s.ubicacion) || 'picking' }));
       return res.json({ tipo: 'producto', sku: skuBuscar, ean: p ? (p.ean || null) : null,
         en_catalogo: !!skuFinal, total: stock.reduce((a, s) => a + s.cantidad, 0),
-        ubicaciones: stock.map(s => ({ ubicacion: s.ubicacion, cantidad: s.cantidad })) });
+        picking: ubicaciones.filter(u => u.rol !== 'reserva').reduce((a, u) => a + u.cantidad, 0),
+        reserva: ubicaciones.filter(u => u.rol === 'reserva').reduce((a, u) => a + u.cantidad, 0),
+        ubicaciones });
     }
     res.json({ tipo: 'desconocido', digitos: dig || null });
   } catch (e) { console.error('[WMS][RESOLVER]', e.message); res.status(500).json({ error: e.message }); }
@@ -4070,6 +4103,60 @@ async function wmsAjustarStock(ubicacion, sku, delta) {
   return nueva;
 }
 
+// Info completa de una ubicación (rol picking/reserva + módulo y su tipo)
+async function wmsUbiInfo(cod) {
+  const { data } = await supabase.from('dep_wms_ubicaciones')
+    .select('codigo,rol,nivel,modulo_id').eq('codigo', cod).limit(1);
+  const u = data && data[0];
+  if (!u) return null;
+  let mod = null;
+  if (u.modulo_id) {
+    const { data: m } = await supabase.from('dep_wms_modulos')
+      .select('id,nombre,tipo,capacidad_kg,niveles').eq('id', u.modulo_id).limit(1);
+    mod = (m && m[0]) || null;
+  }
+  return { codigo: u.codigo, rol: u.rol || 'picking', nivel: u.nivel, modulo: mod,
+    tipo_modulo: mod ? mod.tipo : null, capacidad_kg: mod ? mod.capacidad_kg : null };
+}
+
+// Reglas del DESTINO al guardar/mover mercadería:
+//  · Rack PENETRABLE: no se mezcla — una ubicación solo acepta UN SKU.
+//  · Tope de kg del módulo: si el módulo tiene capacidad y el SKU tiene peso.
+async function wmsValidarDestino(info, sku, cantidad) {
+  if (!info || !info.modulo) return; // ubicación suelta (sin módulo): sin reglas extra
+  if (info.tipo_modulo === 'penetrable') {
+    const { data } = await supabase.from('dep_wms_stock')
+      .select('sku,cantidad').eq('ubicacion', info.codigo).gt('cantidad', 0).neq('sku', sku).limit(1);
+    if (data && data[0])
+      throw new Error(`⛔ ${info.codigo} es de rack PENETRABLE y ya tiene ${data[0].sku} (×${data[0].cantidad}). En penetrables no se mezcla mercadería: vaciala primero o usá otra calle.`);
+  }
+  if (info.capacidad_kg != null && Number(info.capacidad_kg) > 0) {
+    const { data: p } = await supabase.from('dep_productos').select('peso_kg').eq('sku', sku).limit(1);
+    const pesoSku = p && p[0] && p[0].peso_kg != null ? Number(p[0].peso_kg) : null;
+    if (pesoSku != null && pesoSku > 0) {
+      // Peso actual del módulo = Σ (cantidad × peso) de los SKUs con peso conocido
+      const { data: ubisMod } = await supabase.from('dep_wms_ubicaciones')
+        .select('codigo').eq('modulo_id', info.modulo.id);
+      const codigos = (ubisMod || []).map(x => x.codigo);
+      let pesoActual = 0;
+      if (codigos.length) {
+        const { data: st } = await supabase.from('dep_wms_stock')
+          .select('sku,cantidad').in('ubicacion', codigos).gt('cantidad', 0);
+        const skus = [...new Set((st || []).map(x => x.sku))];
+        const pesos = new Map();
+        if (skus.length) {
+          const { data: pr } = await supabase.from('dep_productos').select('sku,peso_kg').in('sku', skus);
+          for (const r of (pr || [])) if (r.peso_kg != null) pesos.set(r.sku, Number(r.peso_kg));
+        }
+        for (const x of (st || [])) { const pk = pesos.get(x.sku); if (pk) pesoActual += x.cantidad * pk; }
+      }
+      const nuevo = pesoActual + cantidad * pesoSku;
+      if (nuevo > Number(info.capacidad_kg))
+        throw new Error(`⛔ El módulo ${info.modulo.nombre} quedaría en ${Math.round(nuevo)} kg y su tope es ${info.capacidad_kg} kg (hoy carga ~${Math.round(pesoActual)} kg). Usá otro módulo.`);
+    }
+  }
+}
+
 // Validaciones comunes de entrada/salida/mover
 async function wmsValidar(req, conDestino) {
   const b = req.body || {};
@@ -4080,15 +4167,30 @@ async function wmsValidar(req, conDestino) {
   const chequear = async (campo, valor) => {
     const cod = wmsNormalizarUbi(valor);
     if (!cod) throw new Error(`Falta la ubicación (${campo})`);
-    const { data } = await supabase.from('dep_wms_ubicaciones').select('codigo').eq('codigo', cod).limit(1);
-    if (!data || !data[0]) throw new Error(`La ubicación ${cod} no existe. Creala en Ubicaciones o revisá la etiqueta.`);
-    return cod;
+    const info = await wmsUbiInfo(cod);
+    if (!info) throw new Error(`La ubicación ${cod} no existe. Creala en el Plano o revisá la etiqueta.`);
+    return info;
   };
   const out = { sku, cantidad };
-  if (conDestino === 'entrada') out.ubicacion = await chequear('destino', b.ubicacion);
-  if (conDestino === 'salida') out.ubicacion = await chequear('origen', b.ubicacion);
-  if (conDestino === 'mover') { out.desde = await chequear('origen', b.desde); out.hacia = await chequear('destino', b.hacia);
-    if (out.desde === out.hacia) throw new Error('Origen y destino son la misma ubicación'); }
+  if (conDestino === 'entrada') {
+    out.info = await chequear('destino', b.ubicacion); out.ubicacion = out.info.codigo;
+    await wmsValidarDestino(out.info, sku, cantidad);
+  }
+  if (conDestino === 'salida') {
+    out.info = await chequear('origen', b.ubicacion); out.ubicacion = out.info.codigo;
+    // ⛔ REGLA DE ORO: de una ubicación de RESERVA (pallets en altura) NO se saca
+    //    mercadería directo. Primero se baja a picking (modo Mover).
+    if (out.info.rol === 'reserva')
+      throw new Error(`🚫 ${out.ubicacion} es RESERVA (nivel ${out.info.nivel || '?'}): de ahí no se pica. Bajá el pallet a una ubicación de picking con el modo Mover y sacá desde ahí.`);
+  }
+  if (conDestino === 'mover') {
+    const iDesde = await chequear('origen', b.desde);
+    const iHacia = await chequear('destino', b.hacia);
+    if (iDesde.codigo === iHacia.codigo) throw new Error('Origen y destino son la misma ubicación');
+    await wmsValidarDestino(iHacia, sku, cantidad);
+    out.desde = iDesde.codigo; out.hacia = iHacia.codigo;
+    out.infoDesde = iDesde; out.infoHacia = iHacia;
+  }
   return out;
 }
 
@@ -4164,7 +4266,268 @@ app.get('/api/despacho/wms/movimientos', async (req, res) => {
   } catch (e) { console.error('[WMS][MOVS]', e.message); res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.83-wms-v1', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
+// ══════════ WMS v2 · plano (módulos), reposición, ajustes y permisos internos ══════════
+const WMS_PESTANAS = ['operar', 'plano', 'reposicion', 'movimientos', 'ajustes'];
+let _wmsAjCache = { t: 0, map: new Map() };
+async function wmsAjuste(clave, def) {
+  if (Date.now() - _wmsAjCache.t > 30000) {
+    try {
+      const { data } = await supabase.from('dep_wms_ajustes').select('clave,valor');
+      _wmsAjCache = { t: Date.now(), map: new Map((data || []).map(r => [r.clave, r.valor])) };
+    } catch (e) { _wmsAjCache.t = Date.now(); }
+  }
+  const v = _wmsAjCache.map.get(clave);
+  return v === undefined || v === null ? def : v;
+}
+
+// Subpestañas internas del WMS que ve este usuario (config → todas)
+const _wmsPermCache = new Map(); // email → { t, pest }
+async function wmsPestDe(req) {
+  if ((req.pestLog || []).includes('config')) return WMS_PESTANAS.slice();
+  const email = ((req.authUser && req.authUser.email) || '').toLowerCase();
+  const c = _wmsPermCache.get(email);
+  if (c && Date.now() - c.t < 60000) return c.pest;
+  let pest = ['operar', 'reposicion'];
+  try {
+    const { data } = await supabase.from('dep_wms_permisos').select('pestanas').eq('email', email).limit(1);
+    if (data && data[0] && Array.isArray(data[0].pestanas) && data[0].pestanas.length)
+      pest = data[0].pestanas.filter(p => WMS_PESTANAS.includes(p));
+  } catch (e) { /* default */ }
+  _wmsPermCache.set(email, { t: Date.now(), pest });
+  return pest;
+}
+app.get('/api/despacho/wms/mis-pestanas', async (req, res) => {
+  res.json({ pestanas: await wmsPestDe(req) });
+});
+
+// ── Módulos del plano ──
+app.get('/api/despacho/wms/modulos', async (_req, res) => {
+  try {
+    const { data, error } = await supabase.from('dep_wms_modulos')
+      .select('id,nombre,tipo,niveles,capacidad_kg,celdas,notas').order('nombre');
+    if (error) throw new Error(error.message);
+    res.json({ modulos: data || [] });
+  } catch (e) { console.error('[WMS][MODULOS]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Mapa de stock completo (para el hover del plano): ubicacion → [{sku, cantidad}]
+app.get('/api/despacho/wms/stock-mapa', async (_req, res) => {
+  try {
+    const st = (await wmsStockTodo()).filter(s => s.cantidad > 0);
+    res.json({ stock: st.map(s => ({ ubicacion: s.ubicacion, sku: s.sku, cantidad: s.cantidad })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Crear/editar un módulo y sincronizar sus ubicaciones.
+// body: { id?, nombre, tipo, niveles, capacidad_kg, celdas:[{f,c,n}], notas }
+app.post('/api/despacho/wms/modulos', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const nombre = String(b.nombre || '').toUpperCase().replace(/[^0-9A-Z_.]/g, '').slice(0, 8);
+    if (!nombre) return res.status(400).json({ error: 'Poné un nombre corto sin guiones (ej. A, EST1, PISO)' });
+    const tipo = ['selectivo', 'penetrable', 'estanteria', 'piso'].includes(b.tipo) ? b.tipo : 'selectivo';
+    let niveles = Math.max(1, Math.min(10, parseInt(b.niveles, 10) || 1));
+    if (tipo === 'piso') niveles = 1;
+    const capacidad_kg = (b.capacidad_kg === null || b.capacidad_kg === '' || b.capacidad_kg === undefined)
+      ? null : Math.max(0, Number(b.capacidad_kg) || 0) || null;
+    const celdas = Array.isArray(b.celdas) ? b.celdas
+      .filter(x => x && Number.isInteger(x.f) && Number.isInteger(x.c) && Number.isInteger(x.n))
+      .slice(0, 400) : [];
+    if (!celdas.length) return res.status(400).json({ error: 'Pintá al menos una celda en el plano' });
+    const enes = new Set(celdas.map(x => x.n));
+    if (enes.size !== celdas.length) return res.status(400).json({ error: 'Columnas repetidas en las celdas' });
+
+    // Las celdas no pueden pisar las de OTRO módulo
+    const { data: otros } = await supabase.from('dep_wms_modulos').select('id,nombre,celdas');
+    for (const o of (otros || [])) {
+      if (b.id && String(o.id) === String(b.id)) continue;
+      if (o.nombre === nombre && !b.id) return res.status(409).json({ error: `Ya existe un módulo llamado ${nombre}` });
+      for (const oc of (o.celdas || []))
+        if (celdas.some(x => x.f === oc.f && x.c === oc.c))
+          return res.status(409).json({ error: `La celda fila ${oc.f + 1}/col ${oc.c + 1} ya es del módulo ${o.nombre}` });
+    }
+
+    // Renombrar con stock: bloqueado (los códigos de las etiquetas cambiarían)
+    let existente = null;
+    if (b.id) {
+      const { data: ex } = await supabase.from('dep_wms_modulos').select('id,nombre').eq('id', b.id).limit(1);
+      existente = ex && ex[0];
+      if (existente && existente.nombre !== nombre) {
+        const { data: ubx } = await supabase.from('dep_wms_ubicaciones').select('codigo').eq('modulo_id', b.id);
+        const cods = (ubx || []).map(x => x.codigo);
+        if (cods.length) {
+          const { data: stx } = await supabase.from('dep_wms_stock').select('id').in('ubicacion', cods).gt('cantidad', 0).limit(1);
+          if (stx && stx.length) return res.status(409).json({ error: 'No se puede renombrar un módulo con stock (las etiquetas ya impresas quedarían inválidas). Vacialo primero.' });
+        }
+        await supabase.from('dep_wms_stock').delete().in('ubicacion', cods.length ? cods : ['—']);
+        await supabase.from('dep_wms_ubicaciones').delete().eq('modulo_id', b.id);
+      }
+    }
+
+    const fila = { nombre, tipo, niveles, capacidad_kg, celdas, notas: (b.notas || '').trim() || null };
+    let modId = b.id || null;
+    if (modId) {
+      const { error } = await supabase.from('dep_wms_modulos').update(fila).eq('id', modId);
+      if (error) throw new Error(error.message);
+    } else {
+      const { data: ins, error } = await supabase.from('dep_wms_modulos').insert(fila).select('id').limit(1);
+      if (error) throw new Error(error.message);
+      modId = ins && ins[0] && ins[0].id;
+    }
+
+    // Sincronizar ubicaciones: crear las que faltan, borrar las que sobran (si están vacías)
+    const objetivo = new Map(); // codigo → {nivel, n}
+    const rolDefault = (nv) => (tipo === 'estanteria' || tipo === 'piso') ? 'picking' : (nv <= 1 ? 'picking' : 'reserva');
+    for (const cel of celdas)
+      for (let nv = 1; nv <= niveles; nv++)
+        objetivo.set(`${nombre}-${String(cel.n).padStart(2, '0')}-${nv}`, { nivel: nv, n: cel.n });
+    const { data: act } = await supabase.from('dep_wms_ubicaciones').select('codigo,rol').eq('modulo_id', modId);
+    const actuales = new Map((act || []).map(x => [x.codigo, x]));
+    const crear = [];
+    for (const [cod, o] of objetivo) if (!actuales.has(cod))
+      crear.push({ codigo: cod, rack: nombre, columna: String(o.n).padStart(2, '0'), estante: String(o.nivel),
+        modulo_id: modId, nivel: o.nivel, rol: rolDefault(o.nivel) });
+    const sobran = [...actuales.keys()].filter(c => !objetivo.has(c));
+    if (sobran.length) {
+      const { data: stS } = await supabase.from('dep_wms_stock').select('ubicacion').in('ubicacion', sobran).gt('cantidad', 0);
+      if (stS && stS.length) return res.status(409).json({ error: `Hay stock en ubicaciones que querés eliminar (${[...new Set(stS.map(x => x.ubicacion))].slice(0, 5).join(', ')}). Movelo primero.` });
+      await supabase.from('dep_wms_stock').delete().in('ubicacion', sobran);
+      await supabase.from('dep_wms_ubicaciones').delete().in('codigo', sobran);
+    }
+    if (crear.length) {
+      const { error } = await supabase.from('dep_wms_ubicaciones').upsert(crear, { onConflict: 'codigo' });
+      if (error) throw new Error(error.message);
+    }
+    console.log(`[WMS] módulo ${nombre} (${tipo}) guardado: ${celdas.length} columnas × ${niveles} niveles`);
+    res.json({ ok: true, id: modId, nombre, ubicaciones: objetivo.size, creadas: crear.length, borradas: sobran.length });
+  } catch (e) { console.error('[WMS][MODULO-GUARDAR]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/despacho/wms/modulos/borrar', async (req, res) => {
+  try {
+    const id = (req.body && req.body.id) || null;
+    if (!id) return res.status(400).json({ error: 'Falta el id del módulo' });
+    const { data: ubx } = await supabase.from('dep_wms_ubicaciones').select('codigo').eq('modulo_id', id);
+    const cods = (ubx || []).map(x => x.codigo);
+    if (cods.length) {
+      const { data: stx } = await supabase.from('dep_wms_stock').select('ubicacion').in('ubicacion', cods).gt('cantidad', 0).limit(1);
+      if (stx && stx.length) return res.status(409).json({ error: 'El módulo tiene stock: vacialo o movelo antes de borrarlo.' });
+      await supabase.from('dep_wms_stock').delete().in('ubicacion', cods);
+      await supabase.from('dep_wms_ubicaciones').delete().eq('modulo_id', id);
+    }
+    const { error } = await supabase.from('dep_wms_modulos').delete().eq('id', id);
+    if (error) throw new Error(error.message);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Cambiar el rol de una ubicación puntual (picking ↔ reserva)
+app.post('/api/despacho/wms/ubicaciones/rol', async (req, res) => {
+  try {
+    const codigo = wmsNormalizarUbi((req.body && req.body.codigo) || '');
+    const rol = (req.body && req.body.rol) === 'reserva' ? 'reserva' : 'picking';
+    if (!codigo) return res.status(400).json({ error: 'Falta el código' });
+    const { error } = await supabase.from('dep_wms_ubicaciones').update({ rol }).eq('codigo', codigo);
+    if (error) throw new Error(error.message);
+    res.json({ ok: true, codigo, rol });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Reposición: qué hay que bajar de reserva a picking ──
+app.get('/api/despacho/wms/reposicion', async (_req, res) => {
+  try {
+    const min = Math.max(0, parseInt(await wmsAjuste('min_picking', '3'), 10) || 3);
+    const st = (await wmsStockTodo()).filter(s => s.cantidad > 0);
+    const cods = [...new Set(st.map(s => s.ubicacion))];
+    const roles = new Map();
+    for (let i = 0; i < cods.length; i += 500) {
+      const { data } = await supabase.from('dep_wms_ubicaciones').select('codigo,rol').in('codigo', cods.slice(i, i + 500));
+      for (const r of (data || [])) roles.set(r.codigo, r.rol || 'picking');
+    }
+    const porSku = new Map();
+    for (const s of st) {
+      let e = porSku.get(s.sku);
+      if (!e) { e = { sku: s.sku, picking: 0, reserva: 0, res_ubis: [], pick_ubis: [] }; porSku.set(s.sku, e); }
+      if (roles.get(s.ubicacion) === 'reserva') { e.reserva += s.cantidad; e.res_ubis.push({ ubicacion: s.ubicacion, cantidad: s.cantidad }); }
+      else { e.picking += s.cantidad; e.pick_ubis.push({ ubicacion: s.ubicacion, cantidad: s.cantidad }); }
+    }
+    const alertas = [...porSku.values()]
+      .filter(e => e.picking < min && e.reserva > 0)
+      .map(e => ({ sku: e.sku, picking: e.picking, reserva: e.reserva,
+        bajar_desde: e.res_ubis.sort((a, b) => b.cantidad - a.cantidad)[0].ubicacion,
+        reponer_en: e.pick_ubis.length ? e.pick_ubis.sort((a, b) => b.cantidad - a.cantidad)[0].ubicacion : null }))
+      .sort((a, b) => a.picking - b.picking || a.sku.localeCompare(b.sku));
+    res.json({ min, alertas });
+  } catch (e) { console.error('[WMS][REPO]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// ── Ajustes internos ──
+app.get('/api/despacho/wms/ajustes', async (_req, res) => {
+  res.json({ min_picking: parseInt(await wmsAjuste('min_picking', '3'), 10) || 3 });
+});
+app.post('/api/despacho/wms/ajustes', async (req, res) => {
+  try {
+    const min = Math.max(0, Math.min(999, parseInt((req.body && req.body.min_picking), 10) || 0));
+    const { error } = await supabase.from('dep_wms_ajustes')
+      .upsert({ clave: 'min_picking', valor: String(min) }, { onConflict: 'clave' });
+    if (error) throw new Error(error.message);
+    _wmsAjCache.t = 0;
+    res.json({ ok: true, min_picking: min });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Pesos por SKU (para el tope de kg) ──
+app.get('/api/despacho/wms/pesos', async (req, res) => {
+  try {
+    const b = String(req.query.buscar || '').replace(/[,()%]/g, ' ').trim();
+    let q = supabase.from('dep_productos').select('sku,ean,peso_kg').order('sku').limit(60);
+    if (b) q = q.ilike('sku', `%${b}%`);
+    const { data, error } = await q;
+    if (error) throw new Error(error.message);
+    res.json({ productos: data || [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/despacho/wms/peso', async (req, res) => {
+  try {
+    const sku = WMS_SANO((req.body && req.body.sku) || '');
+    if (!sku) return res.status(400).json({ error: 'Falta el SKU' });
+    const raw = req.body && req.body.peso_kg;
+    const peso = (raw === null || raw === '' || raw === undefined) ? null : Math.max(0, Number(raw) || 0) || null;
+    const { error } = await supabase.from('dep_productos').update({ peso_kg: peso }).eq('sku', sku);
+    if (error) throw new Error(error.message);
+    res.json({ ok: true, sku, peso_kg: peso });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Permisos internos del WMS (qué subpestaña ve cada email) ──
+app.get('/api/despacho/wms/permisos', async (_req, res) => {
+  try {
+    const { data, error } = await supabase.from('dep_wms_permisos').select('email,pestanas').order('email');
+    if (error) throw new Error(error.message);
+    res.json({ permisos: data || [], pestanas_posibles: WMS_PESTANAS, default: ['operar', 'reposicion'] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/despacho/wms/permisos', async (req, res) => {
+  try {
+    const email = String((req.body && req.body.email) || '').trim().toLowerCase();
+    if (!email || !email.includes('@')) return res.status(400).json({ error: 'Email inválido' });
+    const pl = req.body && req.body.pestanas;
+    if (pl === null) {
+      const { error } = await supabase.from('dep_wms_permisos').delete().eq('email', email);
+      if (error) throw new Error(error.message);
+    } else {
+      const pest = (Array.isArray(pl) ? pl : []).filter(p => WMS_PESTANAS.includes(p));
+      if (!pest.length) return res.status(400).json({ error: 'Marcá al menos una subpestaña (o borrá la fila para volver al default)' });
+      const { error } = await supabase.from('dep_wms_permisos')
+        .upsert({ email, pestanas: pest }, { onConflict: 'email' });
+      if (error) throw new Error(error.message);
+    }
+    _wmsPermCache.delete(email);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.84-wms-v2', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

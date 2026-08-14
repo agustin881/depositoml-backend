@@ -2459,15 +2459,23 @@ app.get('/api/despacho/buscar', async (req, res) => {
     }
 
     // ¿Quién lo escaneó/despachó desde el sistema?
-    let escaneado_por = null, escaneado_at = null, destino_escaneo = null;
+    let escaneado_por = null, escaneado_at = null, destino_escaneo = null, verificacion = null;
     if (shipId) {
-      const { data } = await supabase.from('dep_despachos')
-        .select('usuario,despachado_at,destino_nombre').eq('shipment_id', String(shipId))
+      let sel = 'usuario,despachado_at,destino_nombre,verificacion';
+      let { data, error: eVer } = await supabase.from('dep_despachos')
+        .select(sel).eq('shipment_id', String(shipId))
         .order('despachado_at', { ascending: false }).limit(1);
+      if (eVer && /verificacion/i.test(eVer.message || '')) {
+        // La columna de auditoría no existe todavía en esta base → seguimos sin ella
+        ({ data } = await supabase.from('dep_despachos')
+          .select('usuario,despachado_at,destino_nombre').eq('shipment_id', String(shipId))
+          .order('despachado_at', { ascending: false }).limit(1));
+      }
       if (data && data[0]) {
         escaneado_por = data[0].usuario || null;
         escaneado_at = data[0].despachado_at || null;
         destino_escaneo = data[0].destino_nombre || null;
+        verificacion = data[0].verificacion || null;   // 'ean' | 'aprobado' | null
       }
     }
 
@@ -2480,7 +2488,7 @@ app.get('/api/despacho/buscar', async (req, res) => {
       despachado: ['shipped', 'delivered'].includes(estadoCodigo),
       entregado: estadoCodigo === 'delivered',
       impreso, impreso_at,
-      escaneado_por, escaneado_at, destino_escaneo
+      escaneado_por, escaneado_at, destino_escaneo, verificacion
     });
   } catch (e) {
     console.error('[BUSCAR]', e.message);
@@ -4527,7 +4535,7 @@ app.post('/api/despacho/wms/permisos', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.84-wms-v2', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.85-verif-en-buscar', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

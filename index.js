@@ -4274,6 +4274,108 @@ app.get('/api/despacho/wms/movimientos', async (req, res) => {
   } catch (e) { console.error('[WMS][MOVS]', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// ══════════════════════════════════════════════════════════════════
+//  REPORTE DE VERIFICACIÓN · ¿por qué NO se verifican algunos SKUs?
+//  Cruza los despachos de un rango con el catálogo (dep_productos)
+//  y diagnostica el motivo por SKU. /api/despacho/verif-reporte
+// ══════════════════════════════════════════════════════════════════
+app.get('/api/despacho/verif-reporte', async (req, res) => {
+  try {
+    const hoy = fechaHoyART();
+    const rx = /^\d{4}-\d{2}-\d{2}$/;
+    const hasta = rx.test(req.query.hasta || '') ? req.query.hasta : hoy;
+    let desde = rx.test(req.query.desde || '') ? req.query.desde : hoy;
+    if (desde > hasta) desde = hasta;
+    // Tope de 92 días para no barrer la tabla entera sin querer
+    const dias = Math.round((new Date(hasta + 'T12:00:00Z') - new Date(desde + 'T12:00:00Z')) / 86400000);
+    if (dias > 92) return res.status(400).json({ error: 'El rango máximo es de 92 días' });
+
+    // 1) Despachos del rango (paginado por el tope de 1000 de PostgREST)
+    let desp = [], from = 0;
+    for (;;) {
+      const { data, error } = await supabase.from('dep_despachos')
+        .select('shipment_id,nro_venta,sku,titulo,tipo,verificacion,usuario,despachado_at,destino_nombre')
+        .gte('despachado_at', `${desde}T00:00:00.000-03:00`)
+        .lte('despachado_at', `${hasta}T23:59:59.999-03:00`)
+        .order('despachado_at', { ascending: false })
+        .range(from, from + 999);
+      if (error) throw new Error(error.message);
+      desp = desp.concat(data || []);
+      if (!data || data.length < 1000) break;
+      from += 1000;
+      if (from > 60000) break;
+    }
+
+    // 2) Catálogo de los SKUs que aparecieron
+    const skus = [...new Set(desp.map(d => (d.sku || '').trim().toUpperCase()).filter(Boolean))];
+    const cat = new Map();
+    for (let i = 0; i < skus.length; i += 300) {
+      const { data } = await supabase.from('dep_productos')
+        .select('sku,ean,requiere').in('sku', skus.slice(i, i + 300));
+      for (const p of (data || [])) cat.set(String(p.sku).trim().toUpperCase(), p);
+    }
+
+    // 3) Agrupar por SKU y diagnosticar el motivo
+    const porSku = new Map();
+    let tot = { total: 0, ean: 0, aprobado: 0, sin: 0, sin_sku: 0 };
+    for (const d of desp) {
+      tot.total++;
+      const v = d.verificacion === 'ean' ? 'ean' : d.verificacion === 'aprobado' ? 'aprobado' : 'sin';
+      tot[v]++;
+      const sku = (d.sku || '').trim().toUpperCase();
+      if (!sku) { tot.sin_sku++; continue; }
+      let e = porSku.get(sku);
+      if (!e) e = { sku, titulo: d.titulo || '', total: 0, ean: 0, aprobado: 0, sin: 0 }, porSku.set(sku, e);
+      e.total++; e[v]++;
+      if (!e.titulo && d.titulo) e.titulo = d.titulo;
+    }
+
+    const filas = [...porSku.values()].map(e => {
+      const p = cat.get(e.sku) || null;
+      const enCatalogo = !!p;
+      const tieneEan = !!(p && p.ean);
+      const requiere = p ? (p.requiere !== false) : false;
+      let motivo, accion;
+      if (!enCatalogo) {
+        motivo = 'No está en el catálogo';
+        accion = 'Cargalo en ⚙ Ajustes → Verificación (SKU + EAN) para que se pida verificar';
+      } else if (!requiere) {
+        motivo = 'Marcado como "no requiere verificación"';
+        accion = 'Si querés que se verifique, tildá "Requiere" en el catálogo';
+      } else if (!tieneEan) {
+        motivo = 'En el catálogo pero SIN EAN cargado';
+        accion = 'Cargale el EAN: sin EAN solo se puede verificar tipeando el SKU o con el código de aprobación';
+      } else if (e.sin > 0) {
+        motivo = 'Configurado OK — salió sin verificar igual';
+        accion = 'Revisá si la llave de verificación estaba apagada, o si salió de un depósito sin el tilde "Verifica"';
+      } else {
+        motivo = 'Configurado OK';
+        accion = '';
+      }
+      return { ...e, en_catalogo: enCatalogo, tiene_ean: tieneEan, ean: (p && p.ean) || null, requiere, motivo, accion,
+        pct_verificado: e.total ? Math.round((e.ean / e.total) * 100) : 0 };
+    });
+    // Primero los que más paquetes sacaron sin verificar
+    filas.sort((a, b) => (b.sin + b.aprobado) - (a.sin + a.aprobado) || b.total - a.total || a.sku.localeCompare(b.sku));
+
+    // Resumen de motivos (el "por qué" en una línea)
+    const porMotivo = {};
+    for (const f of filas) {
+      const k = f.motivo;
+      if (!porMotivo[k]) porMotivo[k] = { skus: 0, paquetes_sin_ean: 0 };
+      porMotivo[k].skus++;
+      porMotivo[k].paquetes_sin_ean += (f.sin + f.aprobado);
+    }
+
+    res.json({
+      desde, hasta, totales: tot, skus: filas.length,
+      por_motivo: porMotivo,
+      resumen: filas,
+      detalle: desp.slice(0, 20000)   // para el CSV detallado
+    });
+  } catch (e) { console.error('[VERIF-REPORTE]', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // ══════════ WMS v2 · plano (módulos), reposición, ajustes y permisos internos ══════════
 const WMS_PESTANAS = ['operar', 'plano', 'reposicion', 'movimientos', 'ajustes'];
 let _wmsAjCache = { t: 0, map: new Map() };
@@ -4535,7 +4637,7 @@ app.post('/api/despacho/wms/permisos', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.85-verif-en-buscar', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.86-reporte-verificacion', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

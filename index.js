@@ -4352,7 +4352,9 @@ app.get('/api/despacho/verif-reporte', async (req, res) => {
         motivo = 'Configurado OK';
         accion = '';
       }
-      return { ...e, en_catalogo: enCatalogo, tiene_ean: tieneEan, ean: (p && p.ean) || null, requiere, motivo, accion,
+      // OJO: e.ean es el CONTADOR de verificados por EAN. El código de barras
+      // va en ean_codigo para no pisarlo (bug de v5.86).
+      return { ...e, en_catalogo: enCatalogo, tiene_ean: tieneEan, ean_codigo: (p && p.ean) || null, requiere, motivo, accion,
         pct_verificado: e.total ? Math.round((e.ean / e.total) * 100) : 0 };
     });
     // Primero los que más paquetes sacaron sin verificar
@@ -4637,7 +4639,7 @@ app.post('/api/despacho/wms/permisos', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.86-reporte-verificacion', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.87-reporte-fix-ean', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

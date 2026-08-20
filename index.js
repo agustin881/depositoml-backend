@@ -1691,6 +1691,20 @@ app.post('/api/despacho/verificacion-codigo', async (req, res) => {
 // Listar/buscar productos del catálogo
 app.get('/api/despacho/productos', async (req, res) => {
   try {
+    // ?todo=1 → catálogo COMPLETO paginado (para la descarga masiva)
+    if (String(req.query.todo || '') === '1') {
+      let todos = [], from = 0;
+      for (;;) {
+        const { data, error } = await supabase.from('dep_productos')
+          .select('sku,ean,requiere,peso_kg').order('sku').range(from, from + 999);
+        if (error) throw new Error(error.message);
+        todos = todos.concat(data || []);
+        if (!data || data.length < 1000) break;
+        from += 1000;
+        if (from > 40000) break;
+      }
+      return res.json({ productos: todos, total: todos.length, completo: true });
+    }
     // Sanitizado: coma y paréntesis rompen la sintaxis del filtro .or() de Supabase
     const buscar = (req.query.buscar || '').replace(/[,()]/g, ' ').trim();
     let q = supabase.from('dep_productos').select('sku,ean,requiere').order('sku').limit(120);
@@ -1699,6 +1713,40 @@ app.get('/api/despacho/productos', async (req, res) => {
     if (error) throw new Error(error.message);
     res.json({ productos: data || [] });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Editar un producto del catálogo (permite hasta cambiarle el SKU)
+app.post('/api/despacho/productos/editar', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const original = String(b.sku_original || '').trim().toUpperCase();
+    const sku = String(b.sku || '').trim().toUpperCase();
+    if (!original) return res.status(400).json({ error: 'Falta el SKU original' });
+    if (!sku) return res.status(400).json({ error: 'El SKU no puede quedar vacío' });
+    const ean = String(b.ean || '').replace(/\D/g, '') || null;
+    const requiere = ('requiere' in b) ? !!b.requiere : true;
+
+    // EAN único: no puede estar en otro SKU
+    if (ean) {
+      _prodCache.t = 0; await catalogoProductos();
+      const dueno = (_prodCache.porEan || new Map()).get(ean);
+      if (dueno && String(dueno.sku).toUpperCase() !== sku)
+        return res.status(400).json({ error: `Ese EAN ya está en ${dueno.sku} — un EAN no puede estar en dos SKUs` });
+    }
+    // ¿Le cambió el SKU? Entonces el nuevo no puede pisar a otro existente
+    if (sku !== original) {
+      const { data: ya } = await supabase.from('dep_productos').select('sku').eq('sku', sku).limit(1);
+      if (ya && ya[0]) return res.status(409).json({ error: `Ya existe un producto con el SKU ${sku}` });
+    }
+
+    const fila = { sku, ean, requiere, actualizado_at: new Date().toISOString() };
+    const { error } = await supabase.from('dep_productos').upsert(fila, { onConflict: 'sku' });
+    if (error) throw new Error(error.message);
+    if (sku !== original) await supabase.from('dep_productos').delete().eq('sku', original);
+    _prodCache.t = 0;
+    console.log(`[VERIF] editado ${original}${sku !== original ? ' → ' + sku : ''} (EAN ${ean || '—'}, requiere ${requiere}) por ${(req.authUser && req.authUser.email) || '?'}`);
+    res.json({ ok: true, sku, ean, requiere, renombrado: sku !== original });
+  } catch (e) { console.error('[VERIF][EDITAR]', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // Verificador (banco de pruebas): ¿qué devuelve el catálogo para este código?
@@ -4639,7 +4687,7 @@ app.post('/api/despacho/wms/permisos', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.87-reporte-fix-ean', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.88-catalogo-editar-masivo', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

@@ -1726,11 +1726,15 @@ app.post('/api/despacho/productos/editar', async (req, res) => {
     const ean = String(b.ean || '').replace(/\D/g, '') || null;
     const requiere = ('requiere' in b) ? !!b.requiere : true;
 
-    // EAN único: no puede estar en otro SKU
+    // EAN único: no puede estar en otro SKU.
+    // ⚠ Hay que excluir TAMBIÉN el SKU ORIGINAL: si le cambiás el nombre al SKU
+    //   conservando su EAN, el dueño de ese EAN es el mismo producto que estás
+    //   editando (bug de v5.88: rechazaba el renombre por "EAN duplicado" consigo mismo).
     if (ean) {
       _prodCache.t = 0; await catalogoProductos();
       const dueno = (_prodCache.porEan || new Map()).get(ean);
-      if (dueno && String(dueno.sku).toUpperCase() !== sku)
+      const duenoSku = dueno ? String(dueno.sku).trim().toUpperCase() : null;
+      if (duenoSku && duenoSku !== sku && duenoSku !== original)
         return res.status(400).json({ error: `Ese EAN ya está en ${dueno.sku} — un EAN no puede estar en dos SKUs` });
     }
     // ¿Le cambió el SKU? Entonces el nuevo no puede pisar a otro existente
@@ -4687,7 +4691,7 @@ app.post('/api/despacho/wms/permisos', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.88-catalogo-editar-masivo', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.89-fix-renombrar-sku', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;

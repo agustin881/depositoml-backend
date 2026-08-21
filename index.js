@@ -1744,9 +1744,25 @@ app.post('/api/despacho/productos/editar', async (req, res) => {
     }
 
     const fila = { sku, ean, requiere, actualizado_at: new Date().toISOString() };
-    const { error } = await supabase.from('dep_productos').upsert(fila, { onConflict: 'sku' });
-    if (error) throw new Error(error.message);
-    if (sku !== original) await supabase.from('dep_productos').delete().eq('sku', original);
+    if (sku !== original) {
+      // RENOMBRE: hay que actualizar LA MISMA fila en un solo paso.
+      // (v5.89 insertaba la nueva y después borraba la vieja → durante ese
+      //  instante el EAN quedaba en dos filas y la base lo rechazaba por su
+      //  restricción de EAN único. Con UPDATE la fila es la misma: no choca.)
+      const { error } = await supabase.from('dep_productos').update(fila).eq('sku', original);
+      if (error) {
+        if (/duplicate|unique/i.test(error.message || ''))
+          return res.status(409).json({ error: `No se pudo renombrar: ${sku} o ese EAN ya existen en otro producto.` });
+        throw new Error(error.message);
+      }
+    } else {
+      const { error } = await supabase.from('dep_productos').upsert(fila, { onConflict: 'sku' });
+      if (error) {
+        if (/duplicate|unique/i.test(error.message || ''))
+          return res.status(409).json({ error: 'Ese EAN ya está usado por otro producto del catálogo.' });
+        throw new Error(error.message);
+      }
+    }
     _prodCache.t = 0;
     console.log(`[VERIF] editado ${original}${sku !== original ? ' → ' + sku : ''} (EAN ${ean || '—'}, requiere ${requiere}) por ${(req.authUser && req.authUser.email) || '?'}`);
     res.json({ ok: true, sku, ean, requiere, renombrado: sku !== original });
@@ -4691,7 +4707,7 @@ app.post('/api/despacho/wms/permisos', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.89-fix-renombrar-sku', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
+app.get('/', (_req, res) => res.json({ ok: true, app: 'deposito-backend', fase: '5.90-renombrar-en-un-paso', max_ordenes: MAX_ORDENES, diag_protegido: !!CLAVE_DIAG, deposito_principal: _depCfg.principalIds && _depCfg.principalIds.size ? [..._depCfg.principalIds].map(id => nombreDeposito(id, null) + ' (ID ' + id + ')').join(' + ') : null, token_alerta: _tokenAlerta }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;
